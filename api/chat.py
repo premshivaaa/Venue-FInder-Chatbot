@@ -89,12 +89,16 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
     try:
         # Map event types to Foursquare categories
         category_mapping = {
-            'business': ['13035', '13036', '13037'],  # Business Centers, Conference Centers, Meeting Rooms
-            'sports': ['18008', '18009', '18010'],    # Sports Complexes, Stadiums, Arenas
-            'wedding': ['13065', '13066', '13067'],   # Wedding Venues, Banquet Halls, Event Spaces
-            'social': ['13065', '13066', '13067'],    # Event Spaces, Banquet Halls, Party Venues
-            'graduation': ['13065', '13066', '13067'], # Event Spaces, Banquet Halls, Auditoriums
-            'exhibition': ['10000', '10001', '10002']  # Art Galleries, Museums, Exhibition Centers
+            'business': ['13035', '13036', '13037', '13038'],  # Business Centers, Conference Centers, Meeting Rooms, Co-working Spaces
+            'sports': ['18008', '18009', '18010', '18011'],    # Sports Complexes, Stadiums, Arenas, Sports Clubs
+            'wedding': ['13065', '13066', '13067', '13068'],   # Wedding Venues, Banquet Halls, Event Spaces, Reception Halls
+            'social': ['13065', '13066', '13067', '13068'],    # Event Spaces, Banquet Halls, Party Venues, Reception Halls
+            'graduation': ['13065', '13066', '13067', '13068'], # Event Spaces, Banquet Halls, Auditoriums, Reception Halls
+            'exhibition': ['10000', '10001', '10002', '10003'], # Art Galleries, Museums, Exhibition Centers, Cultural Centers
+            'dining': ['13065', '13066', '13067', '13068'],    # Restaurants, Cafes, Food Courts, Dining Halls
+            'accommodation': ['19000', '19001', '19002'],      # Hotels, Resorts, Hostels
+            'entertainment': ['10000', '10001', '10002', '10003'], # Theaters, Cinemas, Performance Venues
+            'general': ['13065', '13066', '13067', '13068']    # General Event Spaces
         }
 
         categories = category_mapping.get(event_type, ['13065'])  # Default to event spaces
@@ -146,7 +150,7 @@ async def read_root():
 async def chat(request: ChatRequest):
     try:
         context = request.context or {}
-        event_type = context.get('event_type')
+        event_type = context.get('event_type', 'general')
         location = context.get('location')
         capacity = context.get('capacity')
         budget = context.get('budget')
@@ -174,7 +178,7 @@ async def chat(request: ChatRequest):
 
         # Generate response using Gemini
         prompt = f"""
-        You are a helpful venue finding assistant. A user is looking for venues for a {event_type or 'general'} event.
+        You are a helpful venue finding assistant. A user is looking for venues for a {event_type} event.
         {f'Location: {location}' if location else ''}
         {f'Capacity needed: {capacity} people' if capacity else ''}
         {f'Budget: ${budget}' if budget else ''}
@@ -183,11 +187,18 @@ async def chat(request: ChatRequest):
         {json.dumps(venues, indent=2) if venues else 'No venues found matching the criteria.'}
         
         Please provide a helpful response that:
-        1. Acknowledges the user's request
+        1. Acknowledges the user's request and the type of event they're looking for
         2. Mentions any specific requirements (location, capacity, budget)
-        3. Lists the venues found with their key features
-        4. Provides suggestions if no venues were found
-        5. Keeps the response concise and friendly
+        3. If venues are found:
+           - List the top 3-5 venues with their key features
+           - Mention ratings, capacity, and price if available
+           - Highlight any unique features or amenities
+        4. If no venues are found:
+           - Suggest alternative locations or event types
+           - Provide tips for refining the search
+           - Ask for more specific requirements
+        5. Keep the response friendly and conversational
+        6. End with a question to help refine the search if needed
         """
 
         response = model.generate_content(prompt)
