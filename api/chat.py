@@ -103,7 +103,23 @@ def get_venue_details(fsq_id: str) -> Dict:
             headers=headers
         )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        
+        # Get photos if available
+        photos = []
+        if 'photos' in data and data['photos']:
+            for photo in data['photos']:
+                if 'prefix' in photo and 'suffix' in photo:
+                    photos.append(f"{photo['prefix']}original{photo['suffix']}")
+        
+        return {
+            'capacity': data.get('capacity', 0),
+            'description': data.get('description', ''),
+            'amenities': data.get('amenities', []),
+            'hours': data.get('hours', {}),
+            'contact': data.get('contact', {}),
+            'photos': photos
+        }
     except Exception as e:
         logger.error(f"Error getting venue details: {str(e)}")
         return {}
@@ -174,16 +190,14 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
             'business': {
                 'categories': ['13035', '13036', '13037', '13038'],
                 'description': 'business meeting or conference',
-                'keywords': ['conference', 'meeting', 'business', 'corporate']
+                'keywords': ['conference', 'meeting', 'business', 'corporate', 'office', 'work'],
+                'exclude_categories': ['13065', '13066', '13067', '13068']  # Exclude restaurants and event spaces
             },
             'sports': {
                 'categories': ['18008', '18009', '18010', '18011', '18012', '18013', '18014'],
                 'description': 'sports event or tournament',
                 'keywords': ['sports', 'game', 'tournament', 'match', 'basketball', 'court', 'arena', 'stadium', 'gym', 'field', 'sport', 'athletic', 'fitness', 'training', 'competition'],
-                'specific_categories': {
-                    'basketball': ['18008', '18009', '18010', '18011'],
-                    'general': ['18008', '18009', '18010', '18011', '18012', '18013', '18014']
-                }
+                'exclude_categories': ['13065', '13066', '13067', '13068']  # Exclude restaurants and event spaces
             },
             'wedding': {
                 'categories': ['13065', '13066', '13067', '13068'],
@@ -228,29 +242,12 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
         }
 
         event_info = category_mapping.get(event_type, category_mapping['general'])
+        categories = event_info['categories']
         
-        # For sports venues, check for specific sport types
-        if event_type == 'sports':
-            # Extract sport type from the message
-            sport_keywords = {
-                'basketball': ['basketball', 'hoops', 'court'],
-                'soccer': ['soccer', 'football', 'pitch', 'field'],
-                'tennis': ['tennis', 'court'],
-                'baseball': ['baseball', 'diamond', 'field'],
-                'swimming': ['swimming', 'pool', 'aquatic'],
-                'gym': ['gym', 'fitness', 'workout', 'training']
-            }
-            
-            # Get the specific sport categories if available
-            specific_categories = None
-            for sport, keywords in sport_keywords.items():
-                if any(keyword in event_info['keywords'] for keyword in keywords):
-                    specific_categories = event_info['specific_categories'].get(sport)
-                    break
-            
-            categories = specific_categories if specific_categories else event_info['categories']
-        else:
-            categories = event_info['categories']
+        headers = {
+            "Authorization": FOURSQUARE_API_KEY,
+            "accept": "application/json"
+        }
         
         # Enhanced search parameters
         params = {
@@ -261,20 +258,27 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
             "categories": ",".join(categories)
         }
 
-        headers = {
-            "Authorization": FOURSQUARE_API_KEY,
-            "accept": "application/json"
-        }
-
         response = requests.get(FOURSQUARE_BASE_URL, headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
 
         venues = []
         for place in data.get('results', []):
+            # Skip venues that don't match the event type
+            venue_categories = [cat.get('id', '') for cat in place.get('categories', [])]
+            if any(cat in event_info.get('exclude_categories', []) for cat in venue_categories):
+                continue
+
             # Get detailed venue information
             details = get_venue_details(place.get('fsq_id', ''))
-
+            
+            # Get the best available image
+            image = None
+            if details.get('photos'):
+                image = details['photos'][0]
+            elif place.get('photos', [{}])[0].get('prefix'):
+                image = f"{place['photos'][0]['prefix']}original{place['photos'][0]['suffix']}"
+            
             venue = {
                 'name': place.get('name', ''),
                 'type': place.get('categories', [{}])[0].get('name', ''),
@@ -282,7 +286,7 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
                 'rating': place.get('rating', 0),
                 'price': place.get('price', 0),
                 'capacity': details.get('capacity', 0),
-                'image': place.get('photos', [{}])[0].get('prefix', '') + 'original' + place.get('photos', [{}])[0].get('suffix', ''),
+                'image': image,
                 'location': {
                     'lat': place.get('geocodes', {}).get('main', {}).get('latitude'),
                     'lng': place.get('geocodes', {}).get('main', {}).get('longitude')
@@ -331,7 +335,11 @@ def generate_helpful_response(event_type: str, location: str, capacity: int, bud
                 response += f"   - Description: {venue['description'][:100]}...\n"
             response += "\n"
 
-        response += "Would you like more information about any of these venues or would you like to refine your search?"
+        if len(venues) < 10:
+            response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
+        else:
+            response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+
         return response
 
     except Exception as e:
