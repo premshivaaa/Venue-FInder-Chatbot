@@ -118,9 +118,13 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
                 'keywords': ['conference', 'meeting', 'business', 'corporate']
             },
             'sports': {
-                'categories': ['18008', '18009', '18010', '18011'],
+                'categories': ['18008', '18009', '18010', '18011', '18012', '18013', '18014'],
                 'description': 'sports event or tournament',
-                'keywords': ['sports', 'game', 'tournament', 'match']
+                'keywords': ['sports', 'game', 'tournament', 'match', 'basketball', 'court', 'arena', 'stadium', 'gym', 'field', 'sport', 'athletic', 'fitness', 'training', 'competition'],
+                'specific_categories': {
+                    'basketball': ['18008', '18009', '18010', '18011'],
+                    'general': ['18008', '18009', '18010', '18011', '18012', '18013', '18014']
+                }
             },
             'wedding': {
                 'categories': ['13065', '13066', '13067', '13068'],
@@ -165,7 +169,29 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
         }
 
         event_info = category_mapping.get(event_type, category_mapping['general'])
-        categories = event_info['categories']
+        
+        # For sports venues, check for specific sport types
+        if event_type == 'sports':
+            # Extract sport type from the message
+            sport_keywords = {
+                'basketball': ['basketball', 'hoops', 'court'],
+                'soccer': ['soccer', 'football', 'pitch', 'field'],
+                'tennis': ['tennis', 'court'],
+                'baseball': ['baseball', 'diamond', 'field'],
+                'swimming': ['swimming', 'pool', 'aquatic'],
+                'gym': ['gym', 'fitness', 'workout', 'training']
+            }
+            
+            # Get the specific sport categories if available
+            specific_categories = None
+            for sport, keywords in sport_keywords.items():
+                if any(keyword in event_info['keywords'] for keyword in keywords):
+                    specific_categories = event_info['specific_categories'].get(sport)
+                    break
+            
+            categories = specific_categories if specific_categories else event_info['categories']
+        else:
+            categories = event_info['categories']
         
         headers = {
             "Authorization": FOURSQUARE_API_KEY,
@@ -197,6 +223,12 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
                 for place in data.get('results', []):
                     # Get detailed venue information
                     details = get_venue_details(place.get('fsq_id', ''))
+                    
+                    # For sports venues, verify the venue type
+                    if event_type == 'sports':
+                        venue_categories = [cat.get('name', '').lower() for cat in place.get('categories', [])]
+                        if not any(keyword in ' '.join(venue_categories) for keyword in event_info['keywords']):
+                            continue
                     
                     venue = {
                         'name': place.get('name', ''),
