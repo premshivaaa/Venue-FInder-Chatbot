@@ -2,9 +2,9 @@ import os
 import json
 import logging
 from typing import Optional, List, Dict, Tuple
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
@@ -268,9 +268,30 @@ def generate_helpful_response(event_type: str, location: str, capacity: int, bud
         logger.error(f"Error generating response: {str(e)}")
         return "I found some venues for you, but I'm having trouble formatting the details. Would you like to try a different search?"
 
+@app.get("/")
+async def read_root():
+    """Serve the main HTML file."""
+    try:
+        return FileResponse("templates/index.html")
+    except Exception as e:
+        logger.error(f"Error serving index.html: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error serving the application")
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint."""
+    return JSONResponse(content={"status": "healthy"})
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
+        # Validate API keys
+        if not FOURSQUARE_API_KEY or not MAPTILER_API_KEY:
+            return ChatResponse(
+                response="Service configuration error. Please check the API keys.",
+                error="Missing API keys"
+            )
+
         context = request.context or {}
         event_type = context.get('event_type', 'general')
         location = context.get('location')
@@ -315,6 +336,22 @@ async def chat(request: ChatRequest):
             response="I encountered an error while processing your request. Please try again with a different query.",
             error=str(e)
         )
+
+@app.exception_handler(404)
+async def not_found_exception_handler(request: Request, exc: HTTPException):
+    """Handle 404 Not Found errors."""
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "The requested resource was not found. Please check the URL and try again."}
+    )
+
+@app.exception_handler(500)
+async def internal_server_error_handler(request: Request, exc: HTTPException):
+    """Handle 500 Internal Server errors."""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred. Please try again later."}
+    )
 
 if __name__ == "__main__":
     import uvicorn
