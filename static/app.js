@@ -20,12 +20,6 @@ sendBtn.addEventListener('click', handleSendMessage);
 userInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') handleSendMessage();
 });
-userInput.addEventListener('input', () => {
-    if (welcomeMessage) {
-        welcomeMessage.style.display = 'none';
-        welcomeMessage = null;
-    }
-});
 historyBtn.addEventListener('click', toggleHistoryPanel);
 closeHistoryBtn.addEventListener('click', toggleHistoryPanel);
 savedBtn.addEventListener('click', showSavedVenues);
@@ -39,6 +33,16 @@ checkTheme();
 async function handleSendMessage() {
     const message = userInput.value.trim();
     if (!message) return;
+
+    // Remove welcome message with fade effect
+    if (welcomeMessage) {
+        welcomeMessage.style.opacity = '0';
+        welcomeMessage.style.transition = 'opacity 0.5s ease-out';
+        setTimeout(() => {
+            welcomeMessage.remove();
+            welcomeMessage = null;
+        }, 500);
+    }
 
     // Add user message to chat
     addMessage(message, 'user');
@@ -99,12 +103,15 @@ async function handleSendMessage() {
 
 function getEventType(message) {
     const eventTypes = {
-        'business|meeting|conference|corporate': 'business',
-        'sports|game|tournament|match': 'sports',
-        'wedding|reception|marriage': 'wedding',
-        'party|celebration|social': 'social',
-        'graduation|ceremony|commencement': 'graduation',
-        'exhibition|gallery|art|show': 'exhibition'
+        'business|meeting|conference|corporate|office|work': 'business',
+        'sports|game|tournament|match|stadium|arena|gym|field|court': 'sports',
+        'wedding|reception|marriage|ceremony|bridal': 'wedding',
+        'party|celebration|social|event|gathering|get-together': 'social',
+        'graduation|ceremony|commencement|convocation': 'graduation',
+        'exhibition|gallery|art|show|museum|display': 'exhibition',
+        'restaurant|cafe|dining|food|eat|dinner|lunch|breakfast': 'dining',
+        'hotel|resort|accommodation|stay|lodging': 'accommodation',
+        'theater|cinema|movie|play|performance|show': 'entertainment'
     };
 
     for (const [keywords, type] of Object.entries(eventTypes)) {
@@ -112,18 +119,18 @@ function getEventType(message) {
             return type;
         }
     }
-    return null;
+    return 'general';
 }
 
 function getLocation(message) {
     // Extract location using regex
-    const locationMatch = message.match(/\b(in|at|near|around)\s+([^,.!?]+)/i);
+    const locationMatch = message.match(/\b(in|at|near|around|close to|within)\s+([^,.!?]+)/i);
     return locationMatch ? locationMatch[2].trim() : null;
 }
 
 function getCapacity(message) {
     // Extract capacity using regex
-    const capacityMatch = message.match(/\b(\d+)\s*(people|guests|attendees|capacity)\b/i);
+    const capacityMatch = message.match(/\b(\d+)\s*(people|guests|attendees|capacity|persons|individuals)\b/i);
     return capacityMatch ? parseInt(capacityMatch[1]) : null;
 }
 
