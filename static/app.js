@@ -13,11 +13,18 @@ const venueCardTemplate = document.getElementById('venueCardTemplate');
 let chatHistory = JSON.parse(localStorage.getItem('chatHistory')) || [];
 let savedVenues = JSON.parse(localStorage.getItem('savedVenues')) || [];
 let isDarkTheme = localStorage.getItem('theme') === 'dark';
+let welcomeMessage = document.querySelector('.welcome-message');
 
 // Event Listeners
 sendBtn.addEventListener('click', handleSendMessage);
 userInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') handleSendMessage();
+});
+userInput.addEventListener('input', () => {
+    if (welcomeMessage) {
+        welcomeMessage.style.display = 'none';
+        welcomeMessage = null;
+    }
 });
 historyBtn.addEventListener('click', toggleHistoryPanel);
 closeHistoryBtn.addEventListener('click', toggleHistoryPanel);
@@ -48,7 +55,15 @@ async function handleSendMessage() {
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ message })
+            body: JSON.stringify({ 
+                message,
+                context: {
+                    eventType: getEventType(message),
+                    location: getLocation(message),
+                    capacity: getCapacity(message),
+                    budget: getBudget(message)
+                }
+            })
         });
 
         const data = await response.json();
@@ -65,6 +80,8 @@ async function handleSendMessage() {
             // If venues are included in the response, display them
             if (data.venues && data.venues.length > 0) {
                 displayVenues(data.venues);
+            } else {
+                addMessage('I couldn\'t find any venues matching your criteria. Try being more specific about the type of venue you\'re looking for.', 'bot');
             }
         }
 
@@ -78,6 +95,47 @@ async function handleSendMessage() {
 
     // Scroll to bottom
     chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function getEventType(message) {
+    const eventTypes = {
+        'business|meeting|conference|corporate': 'business',
+        'sports|game|tournament|match': 'sports',
+        'wedding|reception|marriage': 'wedding',
+        'party|celebration|social': 'social',
+        'graduation|ceremony|commencement': 'graduation',
+        'exhibition|gallery|art|show': 'exhibition'
+    };
+
+    for (const [keywords, type] of Object.entries(eventTypes)) {
+        if (new RegExp(keywords, 'i').test(message)) {
+            return type;
+        }
+    }
+    return null;
+}
+
+function getLocation(message) {
+    // Extract location using regex
+    const locationMatch = message.match(/\b(in|at|near|around)\s+([^,.!?]+)/i);
+    return locationMatch ? locationMatch[2].trim() : null;
+}
+
+function getCapacity(message) {
+    // Extract capacity using regex
+    const capacityMatch = message.match(/\b(\d+)\s*(people|guests|attendees|capacity)\b/i);
+    return capacityMatch ? parseInt(capacityMatch[1]) : null;
+}
+
+function getBudget(message) {
+    // Extract budget using regex
+    const budgetMatch = message.match(/\b(\$|₹|€|£)?\s*(\d+)\s*(k|thousand|K)?\b/i);
+    if (budgetMatch) {
+        let amount = parseInt(budgetMatch[2]);
+        if (budgetMatch[3]) amount *= 1000;
+        return amount;
+    }
+    return null;
 }
 
 function addMessage(text, type) {
