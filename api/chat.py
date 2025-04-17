@@ -13,12 +13,16 @@ import requests
 from dotenv import load_dotenv
 from datetime import datetime
 import urllib.parse
+import time
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -38,8 +42,12 @@ static_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 # Configure Gemini API
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-model = genai.GenerativeModel('gemini-2.0-flash')
+try:
+    genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+    model = genai.GenerativeModel('gemini-2.0-flash')
+except Exception as e:
+    logger.error(f"Error configuring Gemini API: {str(e)}")
+    model = None
 
 # Foursquare API configuration
 FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
@@ -50,6 +58,16 @@ FOURSQUARE_PHOTOS_URL = "https://api.foursquare.com/v3/places/{}/photos"
 # MapTiler API configuration
 MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
 MAPTILER_GEOCODING_URL = "https://api.maptiler.com/geocoding"
+
+# API Headers
+FOURSQUARE_HEADERS = {
+    "Authorization": FOURSQUARE_API_KEY,
+    "accept": "application/json"
+}
+
+MAPTILER_HEADERS = {
+    "accept": "application/json"
+}
 
 class ChatRequest(BaseModel):
     message: str
@@ -76,6 +94,18 @@ class ChatResponse(BaseModel):
     venues: Optional[List[dict]] = None
     error: Optional[str] = None
 
+def retry_with_backoff(func, max_retries=3, initial_delay=1):
+    """Retry a function with exponential backoff."""
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(delay)
+            delay *= 2
+
 def clean_gemini_response(text: str) -> str:
     """Clean Gemini response by removing markdown formatting."""
     # Remove markdown bold syntax
@@ -85,20 +115,40 @@ def clean_gemini_response(text: str) -> str:
     text = re.sub(r'_(.*?)_', r'\1', text)
     return text.strip()
 
+def get_geocode(location: str) -> Tuple[Optional[float], Optional[float]]:
+    """Get latitude and longitude for a location using MapTiler."""
+    try:
+        def geocode_request():
+            response = requests.get(
+                f"{MAPTILER_GEOCODING_URL}/{urllib.parse.quote(location)}.json",
+                params={"key": MAPTILER_API_KEY},
+                headers=MAPTILER_HEADERS
+            )
+            response.raise_for_status()
+            return response.json()
+
+        data = retry_with_backoff(geocode_request)
+        
+        if data.get('features'):
+            coords = data['features'][0]['center']
+            return coords[1], coords[0]  # latitude, longitude
+        return None, None
+    except Exception as e:
+        logger.error(f"Geocoding error: {str(e)}")
+        return None, None
+
 def get_venue_photos(fsq_id: str) -> List[str]:
     """Get photos for a venue from Foursquare."""
     try:
-        headers = {
-            "Authorization": FOURSQUARE_API_KEY,
-            "accept": "application/json"
-        }
-        
-        response = requests.get(
-            FOURSQUARE_PHOTOS_URL.format(fsq_id),
-            headers=headers
-        )
-        response.raise_for_status()
-        data = response.json()
+        def photos_request():
+            response = requests.get(
+                FOURSQUARE_PHOTOS_URL.format(fsq_id),
+                headers=FOURSQUARE_HEADERS
+            )
+            response.raise_for_status()
+            return response.json()
+
+        data = retry_with_backoff(photos_request)
         
         photos = []
         for photo in data.get('items', []):
@@ -113,17 +163,15 @@ def get_venue_photos(fsq_id: str) -> List[str]:
 def get_venue_details(fsq_id: str) -> Dict:
     """Get detailed information about a venue from Foursquare."""
     try:
-        headers = {
-            "Authorization": FOURSQUARE_API_KEY,
-            "accept": "application/json"
-        }
-        
-        response = requests.get(
-            f"{FOURSQUARE_PLACE_DETAILS_URL}{fsq_id}",
-            headers=headers
-        )
-        response.raise_for_status()
-        data = response.json()
+        def details_request():
+            response = requests.get(
+                f"{FOURSQUARE_PLACE_DETAILS_URL}{fsq_id}",
+                headers=FOURSQUARE_HEADERS
+            )
+            response.raise_for_status()
+            return response.json()
+
+        data = retry_with_backoff(details_request)
         
         # Get photos
         photos = get_venue_photos(fsq_id)
@@ -179,31 +227,36 @@ def extract_event_details(message: str) -> Dict:
         'keywords': []
     }
 
-    # Use Gemini to analyze the message
-    try:
-        prompt = f"""Analyze this venue search request and extract key information:
-        Message: {message}
-        
-        Please provide a JSON response with:
-        1. event_type (business, sports, wedding, social, graduation, exhibition, dining, accommodation, entertainment)
-        2. location (city or area)
-        3. capacity (number of people)
-        4. budget (in dollars)
-        5. specific_requirements (list of specific needs)
-        6. keywords (list of relevant keywords for the search)
-        
-        Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}"""
-        
-        response = model.generate_content(prompt)
+    # Use Gemini for initial analysis if available
+    if model:
         try:
-            gemini_data = json.loads(response.text)
-            details.update(gemini_data)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse Gemini response")
-    except Exception as e:
-        logger.error(f"Error using Gemini for analysis: {str(e)}")
+            prompt = f"""Analyze this venue search request and extract key information:
+            Message: {message}
+            
+            Please provide a JSON response with:
+            1. event_type (business, sports, wedding, social, graduation, exhibition, dining, accommodation, entertainment)
+            2. location (city or area)
+            3. capacity (number of people)
+            4. budget (in dollars)
+            5. specific_requirements (list of specific needs)
+            6. keywords (list of relevant keywords for the search)
+            
+            Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}"""
+            
+            def gemini_request():
+                response = model.generate_content(prompt)
+                return response.text
 
-    # Fallback to regex if Gemini fails
+            gemini_response = retry_with_backoff(gemini_request)
+            try:
+                gemini_data = json.loads(gemini_response)
+                details.update(gemini_data)
+            except json.JSONDecodeError:
+                logger.error("Failed to parse Gemini response")
+        except Exception as e:
+            logger.error(f"Error using Gemini for analysis: {str(e)}")
+
+    # Fallback to regex if Gemini fails or is not available
     if not details['location']:
         location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
         location_match = re.search(location_pattern, message)
@@ -288,11 +341,6 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, keywords: Lis
         event_info = category_mapping.get(event_type, category_mapping['general'])
         categories = event_info['categories']
         
-        headers = {
-            "Authorization": FOURSQUARE_API_KEY,
-            "accept": "application/json"
-        }
-        
         # Try different search strategies
         search_strategies = [
             {"categories": ",".join(categories), "sort": "RATING"},
@@ -303,17 +351,19 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, keywords: Lis
         
         all_venues = []
         for strategy in search_strategies:
-            params = {
-                "ll": f"{lat},{lng}",
-                "radius": radius,
-                "limit": 20,
-                **strategy
-            }
-            
             try:
-                response = requests.get(FOURSQUARE_BASE_URL, headers=headers, params=params)
-                response.raise_for_status()
-                data = response.json()
+                def venue_request():
+                    params = {
+                        "ll": f"{lat},{lng}",
+                        "radius": radius,
+                        "limit": 20,
+                        **strategy
+                    }
+                    response = requests.get(FOURSQUARE_BASE_URL, headers=FOURSQUARE_HEADERS, params=params)
+                    response.raise_for_status()
+                    return response.json()
+
+                data = retry_with_backoff(venue_request)
                 
                 for place in data.get('results', []):
                     # Skip venues that don't match the event type
@@ -385,48 +435,53 @@ def generate_helpful_response(event_type: str, location: str, capacity: int, bud
             
             Would you like to try any of these suggestions?"""
 
-        # Use Gemini to generate a natural response
-        try:
-            prompt = f"""You are a helpful venue finding assistant. A user is looking for venues for a {event_type} event in {location}.
-            {f'Capacity needed: {capacity} people' if capacity else ''}
-            {f'Budget: ${budget}' if budget else ''}
-            
-            Here are the venues I found:
-            {json.dumps(venues, indent=2)}
-            
-            Please provide a helpful, conversational response that:
-            1. Acknowledges the user's request
-            2. Lists the top venues with their key features
-            3. Mentions any specific requirements that were met
-            4. Keeps the response friendly and natural
-            5. Ends with a question to help refine the search if needed"""
-            
-            response = model.generate_content(prompt)
-            return clean_gemini_response(response.text)
-        except Exception as e:
-            logger.error(f"Error using Gemini for response: {str(e)}")
-            # Fallback to template response
-            response = f"I found {len(venues)} venues for your {event_type} event in {location}:\n\n"
-            
-            for i, venue in enumerate(venues, 1):
-                response += f"{i}. {venue['name']}\n"
-                response += f"   - Type: {venue['type']}\n"
-                if venue.get('rating'):
-                    response += f"   - Rating: {venue['rating']}/10\n"
-                if venue.get('capacity'):
-                    response += f"   - Capacity: {venue['capacity']} people\n"
-                if venue.get('price'):
-                    response += f"   - Price Level: {'$' * venue['price']}\n"
-                if venue.get('description'):
-                    response += f"   - Description: {venue['description'][:100]}...\n"
-                response += "\n"
+        # Use Gemini for response generation if available
+        if model:
+            try:
+                def gemini_response():
+                    prompt = f"""You are a helpful venue finding assistant. A user is looking for venues for a {event_type} event in {location}.
+                    {f'Capacity needed: {capacity} people' if capacity else ''}
+                    {f'Budget: ${budget}' if budget else ''}
+                    
+                    Here are the venues I found:
+                    {json.dumps(venues, indent=2)}
+                    
+                    Please provide a helpful, conversational response that:
+                    1. Acknowledges the user's request
+                    2. Lists the top venues with their key features
+                    3. Mentions any specific requirements that were met
+                    4. Keeps the response friendly and natural
+                    5. Ends with a question to help refine the search if needed"""
+                    
+                    response = model.generate_content(prompt)
+                    return clean_gemini_response(response.text)
+                
+                return retry_with_backoff(gemini_response)
+            except Exception as e:
+                logger.error(f"Error using Gemini for response: {str(e)}")
 
-            if len(venues) < 10:
-                response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
-            else:
-                response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+        # Fallback to template response
+        response = f"I found {len(venues)} venues for your {event_type} event in {location}:\n\n"
+        
+        for i, venue in enumerate(venues, 1):
+            response += f"{i}. {venue['name']}\n"
+            response += f"   - Type: {venue['type']}\n"
+            if venue.get('rating'):
+                response += f"   - Rating: {venue['rating']}/10\n"
+            if venue.get('capacity'):
+                response += f"   - Capacity: {venue['capacity']} people\n"
+            if venue.get('price'):
+                response += f"   - Price Level: {'$' * venue['price']}\n"
+            if venue.get('description'):
+                response += f"   - Description: {venue['description'][:100]}...\n"
+            response += "\n"
 
-            return response
+        if len(venues) < 10:
+            response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
+        else:
+            response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+
+        return response
 
     except Exception as e:
         logger.error(f"Error generating response: {str(e)}")
@@ -449,6 +504,13 @@ async def health_check():
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
+        # Validate API keys
+        if not FOURSQUARE_API_KEY or not MAPTILER_API_KEY:
+            return ChatResponse(
+                response="The service is currently unavailable. Please try again later.",
+                error="Missing API keys"
+            )
+
         # Extract event details from the message
         event_details = extract_event_details(request.message)
         
