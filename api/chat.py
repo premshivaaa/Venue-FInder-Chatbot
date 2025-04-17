@@ -12,6 +12,7 @@ import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
 from datetime import datetime
+import urllib.parse
 
 # Load environment variables
 load_dotenv()
@@ -44,6 +45,7 @@ model = genai.GenerativeModel('gemini-2.0-flash')
 FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
 FOURSQUARE_BASE_URL = "https://api.foursquare.com/v3/places/search"
 FOURSQUARE_PLACE_DETAILS_URL = "https://api.foursquare.com/v3/places/"
+FOURSQUARE_PHOTOS_URL = "https://api.foursquare.com/v3/places/{}/photos"
 
 # MapTiler API configuration
 MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
@@ -67,28 +69,46 @@ class Venue(BaseModel):
     amenities: Optional[List[str]]
     hours: Optional[Dict[str, str]]
     contact: Optional[Dict[str, str]]
+    relevance_score: Optional[float]
 
 class ChatResponse(BaseModel):
     response: str
     venues: Optional[List[dict]] = None
     error: Optional[str] = None
 
-def get_geocode(location: str) -> Tuple[Optional[float], Optional[float]]:
-    """Get latitude and longitude for a location using MapTiler."""
+def clean_gemini_response(text: str) -> str:
+    """Clean Gemini response by removing markdown formatting."""
+    # Remove markdown bold syntax
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    # Remove other markdown syntax
+    text = re.sub(r'`(.*?)`', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    return text.strip()
+
+def get_venue_photos(fsq_id: str) -> List[str]:
+    """Get photos for a venue from Foursquare."""
     try:
+        headers = {
+            "Authorization": FOURSQUARE_API_KEY,
+            "accept": "application/json"
+        }
+        
         response = requests.get(
-            f"{MAPTILER_GEOCODING_URL}/{location}.json",
-            params={"key": MAPTILER_API_KEY}
+            FOURSQUARE_PHOTOS_URL.format(fsq_id),
+            headers=headers
         )
         response.raise_for_status()
         data = response.json()
-        if data.get('features'):
-            coords = data['features'][0]['center']
-            return coords[1], coords[0]  # latitude, longitude
-        return None, None
+        
+        photos = []
+        for photo in data.get('items', []):
+            if 'prefix' in photo and 'suffix' in photo:
+                photos.append(f"{photo['prefix']}original{photo['suffix']}")
+        
+        return photos
     except Exception as e:
-        logger.error(f"Geocoding error: {str(e)}")
-        return None, None
+        logger.error(f"Error getting venue photos: {str(e)}")
+        return []
 
 def get_venue_details(fsq_id: str) -> Dict:
     """Get detailed information about a venue from Foursquare."""
@@ -105,12 +125,8 @@ def get_venue_details(fsq_id: str) -> Dict:
         response.raise_for_status()
         data = response.json()
         
-        # Get photos if available
-        photos = []
-        if 'photos' in data and data['photos']:
-            for photo in data['photos']:
-                if 'prefix' in photo and 'suffix' in photo:
-                    photos.append(f"{photo['prefix']}original{photo['suffix']}")
+        # Get photos
+        photos = get_venue_photos(fsq_id)
         
         return {
             'capacity': data.get('capacity', 0),
@@ -124,6 +140,33 @@ def get_venue_details(fsq_id: str) -> Dict:
         logger.error(f"Error getting venue details: {str(e)}")
         return {}
 
+def calculate_relevance_score(venue: dict, event_type: str, keywords: List[str]) -> float:
+    """Calculate a relevance score for a venue based on the search criteria."""
+    score = 0.0
+    
+    # Base score from rating
+    score += venue.get('rating', 0) * 0.2
+    
+    # Category match
+    venue_categories = [cat.lower() for cat in venue.get('categories', [])]
+    for keyword in keywords:
+        if any(keyword in cat for cat in venue_categories):
+            score += 0.3
+    
+    # Description match
+    description = venue.get('description', '').lower()
+    for keyword in keywords:
+        if keyword in description:
+            score += 0.2
+    
+    # Name match
+    name = venue.get('name', '').lower()
+    for keyword in keywords:
+        if keyword in name:
+            score += 0.3
+    
+    return min(score, 1.0)  # Normalize to 0-1 range
+
 def extract_event_details(message: str) -> Dict:
     """Extract event details using NLP techniques."""
     message = message.lower()
@@ -132,72 +175,73 @@ def extract_event_details(message: str) -> Dict:
         'location': None,
         'capacity': None,
         'budget': None,
-        'specific_requirements': []
+        'specific_requirements': [],
+        'keywords': []
     }
 
-    # Event type detection
-    event_patterns = {
-        'business': r'(business|meeting|conference|corporate|office|work|presentation|seminar)',
-        'sports': r'(sports|game|tournament|match|basketball|soccer|tennis|baseball|swimming|gym|fitness|athletic)',
-        'wedding': r'(wedding|reception|marriage|ceremony|bridal)',
-        'social': r'(party|celebration|social|event|gathering|get-together)',
-        'graduation': r'(graduation|ceremony|commencement|convocation)',
-        'exhibition': r'(exhibition|gallery|art|show|museum|display)',
-        'dining': r'(restaurant|cafe|dining|food|eat|dinner|lunch|breakfast)',
-        'accommodation': r'(hotel|resort|accommodation|stay|lodging)',
-        'entertainment': r'(theater|cinema|movie|play|performance|show)'
-    }
+    # Use Gemini to analyze the message
+    try:
+        prompt = f"""Analyze this venue search request and extract key information:
+        Message: {message}
+        
+        Please provide a JSON response with:
+        1. event_type (business, sports, wedding, social, graduation, exhibition, dining, accommodation, entertainment)
+        2. location (city or area)
+        3. capacity (number of people)
+        4. budget (in dollars)
+        5. specific_requirements (list of specific needs)
+        6. keywords (list of relevant keywords for the search)
+        
+        Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}"""
+        
+        response = model.generate_content(prompt)
+        try:
+            gemini_data = json.loads(response.text)
+            details.update(gemini_data)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse Gemini response")
+    except Exception as e:
+        logger.error(f"Error using Gemini for analysis: {str(e)}")
 
-    for event_type, pattern in event_patterns.items():
-        if re.search(pattern, message):
-            details['event_type'] = event_type
-            break
+    # Fallback to regex if Gemini fails
+    if not details['location']:
+        location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
+        location_match = re.search(location_pattern, message)
+        if location_match:
+            details['location'] = location_match.group(2).strip()
 
-    # Location detection
-    location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
-    location_match = re.search(location_pattern, message)
-    if location_match:
-        details['location'] = location_match.group(2).strip()
+    if not details['capacity']:
+        capacity_pattern = r'(\d+)\s*(people|guests|attendees|capacity|persons|individuals)'
+        capacity_match = re.search(capacity_pattern, message)
+        if capacity_match:
+            details['capacity'] = int(capacity_match.group(1))
 
-    # Capacity detection
-    capacity_pattern = r'(\d+)\s*(people|guests|attendees|capacity|persons|individuals)'
-    capacity_match = re.search(capacity_pattern, message)
-    if capacity_match:
-        details['capacity'] = int(capacity_match.group(1))
-
-    # Budget detection
-    budget_pattern = r'(\$|₹|€|£)?\s*(\d+)\s*(k|thousand|K)?'
-    budget_match = re.search(budget_pattern, message)
-    if budget_match:
-        amount = int(budget_match.group(2))
-        if budget_match.group(3):
-            amount *= 1000
-        details['budget'] = amount
-
-    # Specific requirements
-    requirement_keywords = ['outdoor', 'indoor', 'parking', 'catering', 'audio', 'video', 'projector', 'stage', 'seating']
-    for keyword in requirement_keywords:
-        if keyword in message:
-            details['specific_requirements'].append(keyword)
+    if not details['budget']:
+        budget_pattern = r'(\$|₹|€|£)?\s*(\d+)\s*(k|thousand|K)?'
+        budget_match = re.search(budget_pattern, message)
+        if budget_match:
+            amount = int(budget_match.group(2))
+            if budget_match.group(3):
+                amount *= 1000
+            details['budget'] = amount
 
     return details
 
-def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int = 5000) -> List[dict]:
+def get_foursquare_venues(lat: float, lng: float, event_type: str, keywords: List[str], radius: int = 5000) -> List[dict]:
     """Get venues from Foursquare API based on location and event type."""
     try:
-        # Map event types to Foursquare categories with detailed descriptions
         category_mapping = {
             'business': {
                 'categories': ['13035', '13036', '13037', '13038'],
                 'description': 'business meeting or conference',
                 'keywords': ['conference', 'meeting', 'business', 'corporate', 'office', 'work'],
-                'exclude_categories': ['13065', '13066', '13067', '13068']  # Exclude restaurants and event spaces
+                'exclude_categories': ['13065', '13066', '13067', '13068']
             },
             'sports': {
                 'categories': ['18008', '18009', '18010', '18011', '18012', '18013', '18014'],
                 'description': 'sports event or tournament',
                 'keywords': ['sports', 'game', 'tournament', 'match', 'basketball', 'court', 'arena', 'stadium', 'gym', 'field', 'sport', 'athletic', 'fitness', 'training', 'competition'],
-                'exclude_categories': ['13065', '13066', '13067', '13068']  # Exclude restaurants and event spaces
+                'exclude_categories': ['13065', '13066', '13067', '13068']
             },
             'wedding': {
                 'categories': ['13065', '13066', '13067', '13068'],
@@ -249,59 +293,80 @@ def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int =
             "accept": "application/json"
         }
         
-        # Enhanced search parameters
-        params = {
-            "ll": f"{lat},{lng}",
-            "radius": radius,
-            "limit": 20,  # Get more results to filter
-            "sort": "RATING",  # Sort by rating first
-            "categories": ",".join(categories)
-        }
-
-        response = requests.get(FOURSQUARE_BASE_URL, headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-        venues = []
-        for place in data.get('results', []):
-            # Skip venues that don't match the event type
-            venue_categories = [cat.get('id', '') for cat in place.get('categories', [])]
-            if any(cat in event_info.get('exclude_categories', []) for cat in venue_categories):
-                continue
-
-            # Get detailed venue information
-            details = get_venue_details(place.get('fsq_id', ''))
-            
-            # Get the best available image
-            image = None
-            if details.get('photos'):
-                image = details['photos'][0]
-            elif place.get('photos', [{}])[0].get('prefix'):
-                image = f"{place['photos'][0]['prefix']}original{place['photos'][0]['suffix']}"
-            
-            venue = {
-                'name': place.get('name', ''),
-                'type': place.get('categories', [{}])[0].get('name', ''),
-                'address': place.get('location', {}).get('formatted_address', ''),
-                'rating': place.get('rating', 0),
-                'price': place.get('price', 0),
-                'capacity': details.get('capacity', 0),
-                'image': image,
-                'location': {
-                    'lat': place.get('geocodes', {}).get('main', {}).get('latitude'),
-                    'lng': place.get('geocodes', {}).get('main', {}).get('longitude')
-                },
-                'description': details.get('description', ''),
-                'amenities': details.get('amenities', []),
-                'hours': details.get('hours', {}),
-                'contact': details.get('contact', {})
+        # Try different search strategies
+        search_strategies = [
+            {"categories": ",".join(categories), "sort": "RATING"},
+            {"query": " ".join(keywords), "sort": "RATING"},
+            {"categories": ",".join(categories), "sort": "DISTANCE"},
+            {"query": " ".join(keywords), "sort": "DISTANCE"}
+        ]
+        
+        all_venues = []
+        for strategy in search_strategies:
+            params = {
+                "ll": f"{lat},{lng}",
+                "radius": radius,
+                "limit": 20,
+                **strategy
             }
+            
+            try:
+                response = requests.get(FOURSQUARE_BASE_URL, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                for place in data.get('results', []):
+                    # Skip venues that don't match the event type
+                    venue_categories = [cat.get('id', '') for cat in place.get('categories', [])]
+                    if any(cat in event_info.get('exclude_categories', []) for cat in venue_categories):
+                        continue
 
-            venues.append(venue)
-
-        # Sort venues by rating and filter top 10
-        venues.sort(key=lambda x: x.get('rating', 0), reverse=True)
-        return venues[:10]
+                    # Get detailed venue information
+                    details = get_venue_details(place.get('fsq_id', ''))
+                    
+                    # Get the best available image
+                    image = None
+                    if details.get('photos'):
+                        image = details['photos'][0]
+                    elif place.get('photos', [{}])[0].get('prefix'):
+                        image = f"{place['photos'][0]['prefix']}original{place['photos'][0]['suffix']}"
+                    
+                    venue = {
+                        'name': place.get('name', ''),
+                        'type': place.get('categories', [{}])[0].get('name', ''),
+                        'address': place.get('location', {}).get('formatted_address', ''),
+                        'rating': place.get('rating', 0),
+                        'price': place.get('price', 0),
+                        'capacity': details.get('capacity', 0),
+                        'image': image,
+                        'location': {
+                            'lat': place.get('geocodes', {}).get('main', {}).get('latitude'),
+                            'lng': place.get('geocodes', {}).get('main', {}).get('longitude')
+                        },
+                        'description': details.get('description', ''),
+                        'amenities': details.get('amenities', []),
+                        'hours': details.get('hours', {}),
+                        'contact': details.get('contact', {})
+                    }
+                    
+                    # Calculate relevance score
+                    venue['relevance_score'] = calculate_relevance_score(venue, event_type, keywords)
+                    
+                    # Add venue if not already in the list
+                    if not any(v['name'] == venue['name'] for v in all_venues):
+                        all_venues.append(venue)
+                
+            except Exception as e:
+                logger.error(f"Error in search strategy: {str(e)}")
+                continue
+        
+        # Sort by relevance score and rating
+        all_venues.sort(key=lambda x: (x.get('relevance_score', 0), x.get('rating', 0)), reverse=True)
+        
+        # Filter out venues with very low relevance
+        relevant_venues = [v for v in all_venues if v.get('relevance_score', 0) > 0.3]
+        
+        return relevant_venues[:10] if len(relevant_venues) > 10 else relevant_venues
 
     except Exception as e:
         logger.error(f"Foursquare API error: {str(e)}")
@@ -320,27 +385,48 @@ def generate_helpful_response(event_type: str, location: str, capacity: int, bud
             
             Would you like to try any of these suggestions?"""
 
-        response = f"I found the top {len(venues)} venues for your {event_type} event in {location}:\n\n"
-        
-        for i, venue in enumerate(venues, 1):
-            response += f"{i}. {venue['name']}\n"
-            response += f"   - Type: {venue['type']}\n"
-            if venue.get('rating'):
-                response += f"   - Rating: {venue['rating']}/10\n"
-            if venue.get('capacity'):
-                response += f"   - Capacity: {venue['capacity']} people\n"
-            if venue.get('price'):
-                response += f"   - Price Level: {'$' * venue['price']}\n"
-            if venue.get('description'):
-                response += f"   - Description: {venue['description'][:100]}...\n"
-            response += "\n"
+        # Use Gemini to generate a natural response
+        try:
+            prompt = f"""You are a helpful venue finding assistant. A user is looking for venues for a {event_type} event in {location}.
+            {f'Capacity needed: {capacity} people' if capacity else ''}
+            {f'Budget: ${budget}' if budget else ''}
+            
+            Here are the venues I found:
+            {json.dumps(venues, indent=2)}
+            
+            Please provide a helpful, conversational response that:
+            1. Acknowledges the user's request
+            2. Lists the top venues with their key features
+            3. Mentions any specific requirements that were met
+            4. Keeps the response friendly and natural
+            5. Ends with a question to help refine the search if needed"""
+            
+            response = model.generate_content(prompt)
+            return clean_gemini_response(response.text)
+        except Exception as e:
+            logger.error(f"Error using Gemini for response: {str(e)}")
+            # Fallback to template response
+            response = f"I found {len(venues)} venues for your {event_type} event in {location}:\n\n"
+            
+            for i, venue in enumerate(venues, 1):
+                response += f"{i}. {venue['name']}\n"
+                response += f"   - Type: {venue['type']}\n"
+                if venue.get('rating'):
+                    response += f"   - Rating: {venue['rating']}/10\n"
+                if venue.get('capacity'):
+                    response += f"   - Capacity: {venue['capacity']} people\n"
+                if venue.get('price'):
+                    response += f"   - Price Level: {'$' * venue['price']}\n"
+                if venue.get('description'):
+                    response += f"   - Description: {venue['description'][:100]}...\n"
+                response += "\n"
 
-        if len(venues) < 10:
-            response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
-        else:
-            response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+            if len(venues) < 10:
+                response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
+            else:
+                response += "\nWould you like more information about any of these venues or would you like to refine your search?"
 
-        return response
+            return response
 
     except Exception as e:
         logger.error(f"Error generating response: {str(e)}")
@@ -382,7 +468,12 @@ async def chat(request: ChatRequest):
             )
 
         # Get venues from Foursquare
-        venues = get_foursquare_venues(lat, lng, event_details['event_type'])
+        venues = get_foursquare_venues(
+            lat, 
+            lng, 
+            event_details['event_type'],
+            event_details['keywords']
+        )
         
         # Filter venues based on capacity and budget if provided
         if event_details['capacity']:
