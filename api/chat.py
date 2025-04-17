@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -34,19 +35,21 @@ app.add_middleware(
 static_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 app.mount("/static", StaticFiles(directory=static_path), name="static")
 
-# Configure Gemini AI
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-2.0-flash')
+# Configure Gemini API
+genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+model = genai.GenerativeModel('gemini-pro')
 
 # Foursquare API configuration
-FOURSQUARE_API_KEY = os.getenv("FOURSQUARE_API_KEY")
-FOURSQUARE_API_URL = "https://api.foursquare.com/v3"
+FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
+FOURSQUARE_BASE_URL = "https://api.foursquare.com/v3/places/search"
 
 # MapTiler API configuration
-MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY")
+MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
+MAPTILER_GEOCODING_URL = "https://api.maptiler.com/geocoding"
 
 class ChatRequest(BaseModel):
     message: str
+    context: Optional[dict] = None
 
 class Venue(BaseModel):
     name: str
@@ -61,141 +64,142 @@ class Venue(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
-    venues: Optional[List[Venue]] = None
+    venues: Optional[List[dict]] = None
+    error: Optional[str] = None
 
-def get_venue_type(query: str) -> str:
-    """Determine if the query is about sports venues or personal venues."""
-    sports_keywords = ["sports", "stadium", "arena", "field", "court", "gym"]
-    if any(keyword in query.lower() for keyword in sports_keywords):
-        return "sports"
-    return "personal"
-
-async def get_coordinates(location: str) -> tuple:
-    """Get coordinates for a location using MapTiler's geocoding API."""
+def get_geocode(location: str) -> tuple:
+    """Get latitude and longitude for a location using MapTiler."""
     try:
-        url = f"https://api.maptiler.com/geocoding/{location}.json?key={MAPTILER_API_KEY}"
-        response = requests.get(url)
+        response = requests.get(
+            f"{MAPTILER_GEOCODING_URL}/{location}.json",
+            params={"key": MAPTILER_API_KEY}
+        )
+        response.raise_for_status()
         data = response.json()
-        
-        if data["features"]:
-            coordinates = data["features"][0]["geometry"]["coordinates"]
-            return coordinates[1], coordinates[0]  # lat, lng
+        if data.get('features'):
+            coords = data['features'][0]['center']
+            return coords[1], coords[0]  # latitude, longitude
         return None, None
     except Exception as e:
-        logger.error(f"Error getting coordinates: {e}")
+        logger.error(f"Geocoding error: {str(e)}")
         return None, None
 
-async def search_venues(query: str, location: str) -> List[Venue]:
-    """Search for venues using Foursquare API."""
+def get_foursquare_venues(lat: float, lng: float, event_type: str, radius: int = 5000) -> List[dict]:
+    """Get venues from Foursquare API based on location and event type."""
     try:
-        # Get coordinates for the location
-        lat, lng = await get_coordinates(location)
-        if not lat or not lng:
-            raise HTTPException(status_code=400, detail="Location not found")
+        # Map event types to Foursquare categories
+        category_mapping = {
+            'business': ['13035', '13036', '13037'],  # Business Centers, Conference Centers, Meeting Rooms
+            'sports': ['18008', '18009', '18010'],    # Sports Complexes, Stadiums, Arenas
+            'wedding': ['13065', '13066', '13067'],   # Wedding Venues, Banquet Halls, Event Spaces
+            'social': ['13065', '13066', '13067'],    # Event Spaces, Banquet Halls, Party Venues
+            'graduation': ['13065', '13066', '13067'], # Event Spaces, Banquet Halls, Auditoriums
+            'exhibition': ['10000', '10001', '10002']  # Art Galleries, Museums, Exhibition Centers
+        }
 
-        # Prepare Foursquare API request
+        categories = category_mapping.get(event_type, ['13065'])  # Default to event spaces
+        
         headers = {
-            "Accept": "application/json",
-            "Authorization": FOURSQUARE_API_KEY
+            "Authorization": FOURSQUARE_API_KEY,
+            "accept": "application/json"
         }
         
         params = {
-            "query": query,
             "ll": f"{lat},{lng}",
-            "radius": 5000,
-            "limit": 5,
-            "sort": "RATING"
+            "radius": radius,
+            "categories": ",".join(categories),
+            "limit": 10,
+            "sort": "DISTANCE"
         }
         
-        response = requests.get(
-            f"{FOURSQUARE_API_URL}/places/search",
-            headers=headers,
-            params=params
-        )
+        response = requests.get(FOURSQUARE_BASE_URL, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
         
-        venues_data = response.json()["results"]
         venues = []
-        
-        for venue in venues_data:
-            # Get additional venue details
-            venue_id = venue["fsq_id"]
-            details_response = requests.get(
-                f"{FOURSQUARE_API_URL}/places/{venue_id}",
-                headers=headers
-            )
-            details = details_response.json()
-            
-            # Get venue photos
-            photos_response = requests.get(
-                f"{FOURSQUARE_API_URL}/places/{venue_id}/photos",
-                headers=headers
-            )
-            photos = photos_response.json()
-            
-            # Create venue object
-            venue_obj = Venue(
-                name=venue.get("name", ""),
-                type=venue.get("categories", [{}])[0].get("name", "Venue"),
-                address=venue.get("location", {}).get("formatted_address", ""),
-                rating=venue.get("rating", None),
-                price=details.get("price", None),
-                capacity=details.get("capacity", None),
-                image=photos[0]["prefix"] + "original" + photos[0]["suffix"] if photos else None,
-                latitude=venue["geocodes"]["main"]["latitude"],
-                longitude=venue["geocodes"]["main"]["longitude"]
-            )
-            venues.append(venue_obj)
+        for place in data.get('results', []):
+            venue = {
+                'name': place.get('name', ''),
+                'type': place.get('categories', [{}])[0].get('name', ''),
+                'address': place.get('location', {}).get('formatted_address', ''),
+                'rating': place.get('rating', 0),
+                'price': place.get('price', 0),
+                'capacity': place.get('capacity', 0),
+                'image': place.get('photos', [{}])[0].get('prefix', '') + 'original' + place.get('photos', [{}])[0].get('suffix', ''),
+                'location': {
+                    'lat': place.get('geocodes', {}).get('main', {}).get('latitude'),
+                    'lng': place.get('geocodes', {}).get('main', {}).get('longitude')
+                }
+            }
+            venues.append(venue)
         
         return venues
     except Exception as e:
-        logger.error(f"Error searching venues: {e}")
-        raise HTTPException(status_code=500, detail="Error searching venues")
+        logger.error(f"Foursquare API error: {str(e)}")
+        return []
 
 @app.get("/")
 async def read_root():
     return FileResponse("templates/index.html")
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def process_chat(request: ChatRequest):
+async def chat(request: ChatRequest):
     try:
-        # Generate AI response
-        chat = model.start_chat(history=[])
-        response = chat.send_message(f"""
-        You are a venue finder assistant. Help the user find venues based on their query:
-        "{request.message}"
+        context = request.context or {}
+        event_type = context.get('event_type')
+        location = context.get('location')
+        capacity = context.get('capacity')
+        budget = context.get('budget')
+
+        # Get location coordinates
+        lat, lng = None, None
+        if location:
+            lat, lng = get_geocode(location)
+            if not lat or not lng:
+                return ChatResponse(
+                    response="I couldn't find that location. Please try being more specific about the location.",
+                    venues=None
+                )
+
+        # Get venues from Foursquare
+        venues = []
+        if lat and lng:
+            venues = get_foursquare_venues(lat, lng, event_type)
+            
+            # Filter venues based on capacity and budget if provided
+            if capacity:
+                venues = [v for v in venues if v.get('capacity', 0) >= capacity]
+            if budget:
+                venues = [v for v in venues if v.get('price', 0) <= budget]
+
+        # Generate response using Gemini
+        prompt = f"""
+        You are a helpful venue finding assistant. A user is looking for venues for a {event_type or 'general'} event.
+        {f'Location: {location}' if location else ''}
+        {f'Capacity needed: {capacity} people' if capacity else ''}
+        {f'Budget: ${budget}' if budget else ''}
         
-        If this is not a venue-related query, politely inform the user that you can only help with venue-related questions.
-        If it is a venue query, extract the location and type of venue they're looking for.
-        """)
+        Here are some relevant venues I found:
+        {json.dumps(venues, indent=2) if venues else 'No venues found matching the criteria.'}
         
-        # Check if it's a venue-related query
-        if "sorry" in response.text.lower() or "can only help" in response.text.lower():
-            return ChatResponse(
-                response="I apologize, but I can only help you find venues and locations. Please ask me about finding sports venues, restaurants, meeting places, or other locations!"
-            )
-        
-        # Extract location and venue type from the query
-        venue_type = get_venue_type(request.message)
-        
-        # Use AI to extract location
-        location_response = chat.send_message(f"Extract only the location/city name from this query: {request.message}")
-        location = location_response.text.strip()
-        
-        # Search for venues
-        venues = await search_venues(request.message, location)
-        
-        # Generate a natural response
-        venue_response = f"I found some {venue_type} venues in {location} that might interest you. "
-        venue_response += "Here are the top recommendations based on ratings and reviews:"
+        Please provide a helpful response that:
+        1. Acknowledges the user's request
+        2. Mentions any specific requirements (location, capacity, budget)
+        3. Lists the venues found with their key features
+        4. Provides suggestions if no venues were found
+        5. Keeps the response concise and friendly
+        """
+
+        response = model.generate_content(prompt)
         
         return ChatResponse(
-            response=venue_response,
-            venues=venues
+            response=response.text,
+            venues=venues if venues else None
         )
-        
+
     except Exception as e:
-        logger.error(f"Error processing chat: {e}")
-        raise HTTPException(status_code=500, detail="Error processing request")
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
