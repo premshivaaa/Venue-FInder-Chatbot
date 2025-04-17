@@ -451,7 +451,9 @@ def generate_helpful_response(event_type: str, location: str, capacity: int, bud
                     2. Lists the top venues with their key features
                     3. Mentions any specific requirements that were met
                     4. Keeps the response friendly and natural
-                    5. Ends with a question to help refine the search if needed"""
+                    5. Ends with a question to help refine the search if needed
+                    
+                    Format the response in a clear, easy-to-read way without any markdown or special formatting."""
                     
                     response = model.generate_content(prompt)
                     return clean_gemini_response(response.text)
@@ -507,8 +509,15 @@ async def chat(request: ChatRequest):
         # Validate API keys
         if not FOURSQUARE_API_KEY or not MAPTILER_API_KEY:
             return ChatResponse(
-                response="The service is currently unavailable. Please try again later.",
+                response="I'm currently having trouble accessing the venue database. Please try again in a few moments.",
                 error="Missing API keys"
+            )
+
+        # Validate message
+        if not request.message or len(request.message.strip()) < 3:
+            return ChatResponse(
+                response="Please provide more details about the venue you're looking for. For example: 'Find a wedding venue in New York for 200 people'",
+                venues=None
             )
 
         # Extract event details from the message
@@ -517,7 +526,7 @@ async def chat(request: ChatRequest):
         # Validate location
         if not event_details['location']:
             return ChatResponse(
-                response="Please specify a location for your event. For example: 'Find venues in New York'",
+                response="I need to know where you're looking for venues. Please include a location in your request. For example: 'Find venues in New York'",
                 venues=None
             )
 
@@ -525,7 +534,7 @@ async def chat(request: ChatRequest):
         lat, lng = get_geocode(event_details['location'])
         if not lat or not lng:
             return ChatResponse(
-                response=f"I couldn't find the location '{event_details['location']}'. Please try being more specific or check the spelling.",
+                response=f"I couldn't find the location '{event_details['location']}'. Please try being more specific or check the spelling. You can try:\n1. Using the full city name\n2. Adding the state or country\n3. Using a nearby landmark",
                 venues=None
             )
 
@@ -560,7 +569,7 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"Error in chat endpoint: {str(e)}")
         return ChatResponse(
-            response="I encountered an error while processing your request. Please try again with a different query.",
+            response="I'm having trouble processing your request right now. Please try again with a different query or try again in a few moments.",
             error=str(e)
         )
 
