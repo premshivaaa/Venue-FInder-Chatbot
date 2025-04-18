@@ -7,13 +7,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 import time
+from functools import lru_cache
+from ratelimit import limits, sleep_and_retry
 
 # Load environment variables
 load_dotenv()
@@ -75,9 +77,47 @@ MAPTILER_HEADERS = {
     "accept": "application/json"
 }
 
+# Rate limiting configuration
+ONE_MINUTE = 60
+MAX_CALLS_PER_MINUTE = 30
+
+@sleep_and_retry
+@limits(calls=MAX_CALLS_PER_MINUTE, period=ONE_MINUTE)
+def rate_limited_request(url: str, headers: dict, params: dict = None, timeout: int = 10) -> requests.Response:
+    """Make a rate-limited HTTP request."""
+    return requests.get(url, headers=headers, params=params, timeout=timeout)
+
+# Cache configuration
+@lru_cache(maxsize=1000)
+def cached_geocode(location: str) -> Tuple[Optional[float], Optional[float]]:
+    """Cached version of get_geocode."""
+    return get_geocode(location)
+
+@lru_cache(maxsize=1000)
+def cached_venue_details(fsq_id: str) -> Dict[str, Any]:
+    """Cached version of get_venue_details."""
+    return get_venue_details(fsq_id)
+
 class ChatRequest(BaseModel):
     message: str
     context: Optional[dict] = None
+
+    @validator('message')
+    def validate_message(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError('Message cannot be empty')
+        if len(v) > 1000:
+            raise ValueError('Message is too long (max 1000 characters)')
+        return v.strip()
+
+    @validator('context')
+    def validate_context(cls, v):
+        if v is not None:
+            if not isinstance(v, dict):
+                raise ValueError('Context must be a dictionary')
+            if len(v) > 10:
+                raise ValueError('Context has too many items (max 10)')
+        return v
 
 class Venue(BaseModel):
     name: str
@@ -250,130 +290,111 @@ def calculate_relevance_score(venue: dict, event_type: str, keywords: List[str])
         if keyword.lower() in description:
             score += 0.2
     
-    # Name match
-    name = venue.get('name', '').lower()
-    for keyword in keywords:
-        if keyword.lower() in name:
-            score += 0.3
+    # Event type match
+    if event_type and event_type.lower() in description:
+        score += 0.3
     
-    return min(score, 1.0)  # Normalize to 0-1 range
+    # Capacity consideration
+    capacity = venue.get('capacity', 0)
+    if capacity > 0:
+        score += min(capacity / 1000, 0.2)  # Normalize capacity score
+    
+    return min(score, 1.0)  # Cap score at 1.0
 
 def extract_event_details(message: str) -> Dict[str, Any]:
-    """Extract event details from the user message."""
-    message = message.lower()
-    details = {
-        'event_type': 'general',
-        'location': None,
-        'capacity': None,
-        'budget': None,
-        'specific_requirements': [],
-        'keywords': []
-    }
-
-    # Use Gemini for analysis if available
-    if model:
+    """Extract event details from user message using Gemini."""
+    try:
+        prompt = f"""
+        Extract the following information from this message about an event:
+        - Event type (e.g., wedding, conference, party)
+        - Location (city, state, or specific address)
+        - Number of attendees (if mentioned)
+        - Date (if mentioned)
+        - Any specific requirements or preferences
+        
+        Message: {message}
+        
+        Return the information in JSON format with these keys:
+        event_type, location, attendees, date, requirements
+        """
+        
+        def gemini_request():
+            response = model.generate_content(prompt)
+            return response.text
+        
+        result = retry_with_backoff(gemini_request)
+        
         try:
-            prompt = f"""Analyze this venue search request and extract key information:
-            Message: {message}
-            
-            Please provide a JSON response with:
-            1. event_type (business, wedding, social, conference, sports, dining, accommodation)
-            2. location (city or area)
-            3. capacity (number of people)
-            4. budget (in dollars)
-            5. specific_requirements (list of specific needs)
-            6. keywords (list of relevant keywords for the search)
-            
-            Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}
-            
-            If any field is not found, use null or an empty list."""
-            
-            def gemini_request():
-                response = model.generate_content(prompt)
-                return response.text
-
-            gemini_response = retry_with_backoff(gemini_request)
-            try:
-                gemini_data = json.loads(gemini_response)
-                details.update(gemini_data)
-            except json.JSONDecodeError:
-                logger.error("Failed to parse Gemini response")
-        except Exception as e:
-            logger.error(f"Error using Gemini for analysis: {str(e)}")
-
-    # Fallback to regex extraction
-    if not details['location']:
-        location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
-        location_match = re.search(location_pattern, message)
-        if location_match:
-            details['location'] = location_match.group(2).strip()
-
-    if not details['capacity']:
-        capacity_pattern = r'(\d+)\s*(people|guests|attendees|capacity|persons|individuals)'
-        capacity_match = re.search(capacity_pattern, message)
-        if capacity_match:
-            details['capacity'] = int(capacity_match.group(1))
-
-    if not details['budget']:
-        budget_pattern = r'(\$|₹|€|£)?\s*(\d+)\s*(k|thousand|K)?'
-        budget_match = re.search(budget_pattern, message)
-        if budget_match:
-            amount = int(budget_match.group(2))
-            if budget_match.group(3):
-                amount *= 1000
-            details['budget'] = amount
-
-    # Extract keywords if not provided by Gemini
-    if not details['keywords']:
-        words = re.findall(r'\b\w{4,}\b', message)
-        details['keywords'] = [word for word in words if word not in ['find', 'looking', 'for', 'venue', 'place']]
-
-    return details
+            data = json.loads(result)
+            return {
+                'event_type': data.get('event_type', ''),
+                'location': data.get('location', ''),
+                'attendees': data.get('attendees', 0),
+                'date': data.get('date', ''),
+                'requirements': data.get('requirements', [])
+            }
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse Gemini response: {result}")
+            return {
+                'event_type': '',
+                'location': '',
+                'attendees': 0,
+                'date': '',
+                'requirements': []
+            }
+    except Exception as e:
+        logger.error(f"Error extracting event details: {str(e)}")
+        return {
+            'event_type': '',
+            'location': '',
+            'attendees': 0,
+            'date': '',
+            'requirements': []
+        }
 
 def search_foursquare_venues(location: str, query: str, limit: int = 10) -> List[dict]:
-    """Search for venues using Foursquare API."""
+    """Search for venues using Foursquare API with rate limiting."""
     try:
+        lat, lng = cached_geocode(location)
+        if not lat or not lng:
+            logger.error(f"Could not geocode location: {location}")
+            return []
+
         params = {
+            'll': f"{lat},{lng}",
             'query': query,
-            'near': location,
             'limit': limit,
-            'fields': 'name,location,rating,price,fsq_id,geocodes,photos,categories,description'
+            'radius': 50000,  # 50km radius
+            'sort': 'DISTANCE'
         }
-        
-        response = requests.get(
-            FOURSQUARE_BASE_URL,
-            headers=FOURSQUARE_HEADERS,
-            params=params,
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json().get('results', [])
+
+        def venues_request():
+            response = rate_limited_request(
+                FOURSQUARE_BASE_URL,
+                headers=FOURSQUARE_HEADERS,
+                params=params
+            )
+            response.raise_for_status()
+            return response.json()
+
+        data = retry_with_backoff(venues_request)
+        return data.get('results', [])
     except Exception as e:
-        logger.error(f"Foursquare API error for query '{query}' in '{location}': {str(e)}")
+        logger.error(f"Error searching Foursquare venues: {str(e)}")
         return []
 
 def get_gemini_response(message: str) -> str:
-    """Get response from Gemini API."""
+    """Get response from Gemini with improved error handling."""
     try:
-        prompt = {
-            "contents": [{
-                "parts": [{
-                    "text": f"User: {message}\nAssistant:"
-                }]
-            }]
-        }
-        
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-            json=prompt,
-            timeout=10
-        )
-        response.raise_for_status()
-        result = response.json()
-        return clean_gemini_response(result['candidates'][0]['content']['parts'][0]['text'])
+        def gemini_request():
+            response = model.generate_content(message)
+            return response.text
+
+        result = retry_with_backoff(gemini_request)
+        return clean_gemini_response(result)
     except Exception as e:
-        logger.error(f"Gemini API error: {str(e)}")
-        return "I'm having trouble processing your request. Please try again."
+        logger.error(f"Error getting Gemini response: {str(e)}")
+        return "I apologize, but I'm having trouble processing your request right now. Please try again later."
 
 @app.get("/")
 async def read_root():
@@ -391,91 +412,58 @@ async def health_check():
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-    """Handle chat requests and venue searches."""
+    """Handle chat requests with improved error handling and validation."""
     try:
-        # Validate input
-        if not request.message or len(request.message.strip()) < 3:
-            raise HTTPException(
-                status_code=400,
-                detail="Please provide more details about the venue you're looking for."
-            )
-
         # Extract event details
         event_details = extract_event_details(request.message)
-        location = event_details.get('location')
-        
-        if not location:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "response": "Please specify a location in your request (e.g., 'Find venues in New York')."
-                }
+        if not event_details['location']:
+            return ChatResponse(
+                response="I need to know the location to help you find venues. Please specify where you're looking.",
+                error="Location not specified"
             )
-
-        # Get coordinates for the location
-        lat, lng = get_geocode(location)
-        if not lat or not lng:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "response": f"I couldn't find the location '{location}'. Please try being more specific."
-                }
-            )
-
-        # Determine search query based on event type
-        query_mapping = {
-            'wedding': 'wedding venue',
-            'business': 'conference center',
-            'conference': 'conference center',
-            'sports': 'sports venue',
-            'dining': 'restaurant',
-            'accommodation': 'hotel',
-            'social': 'event space'
-        }
-        
-        query = query_mapping.get(event_details['event_type'], 'venue')
-        if event_details['keywords']:
-            query = ' '.join([query] + event_details['keywords'][:2])
 
         # Search for venues
-        raw_venues = search_foursquare_venues(location, query)
-        if not raw_venues:
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "response": f"I couldn't find any {query} venues in {location}. Try broadening your search criteria.",
-                    "venues": []
-                }
-            )
-
-        # Process venues with relevance scoring
-        venues = process_venues(raw_venues, event_details['event_type'], event_details['keywords'])
-        
-        # Generate response
-        try:
-            response = get_gemini_response(
-                f"Generate a friendly response about finding {len(venues)} {query} venues in {location}"
-            )
-        except Exception:
-            response = f"I found {len(venues)} venues in {location} that match your criteria."
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "response": response,
-                "venues": venues[:10]  # Return top 10 venues
-            }
+        venues = search_foursquare_venues(
+            event_details['location'],
+            f"{event_details['event_type']} venue",
+            limit=5
         )
 
-    except HTTPException as he:
-        raise he
+        if not venues:
+            return ChatResponse(
+                response=f"I couldn't find any venues in {event_details['location']} for {event_details['event_type']}. Please try a different location or event type.",
+                error="No venues found"
+            )
+
+        # Process venues
+        processed_venues = process_venues(
+            venues,
+            event_details['event_type'],
+            event_details['requirements']
+        )
+
+        # Generate response
+        response = get_gemini_response(
+            f"Based on the following venues, provide a helpful response to the user's request: {request.message}\n\n"
+            f"Available venues: {json.dumps(processed_venues[:3])}"
+        )
+
+        return ChatResponse(
+            response=response,
+            venues=processed_venues[:3]  # Return top 3 most relevant venues
+        )
+
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        return ChatResponse(
+            response="I'm sorry, but I couldn't process your request. Please check your input and try again.",
+            error=str(e)
+        )
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="An error occurred while processing your request. Please try again."
+        logger.error(f"Unexpected error in chat endpoint: {str(e)}")
+        return ChatResponse(
+            response="I'm sorry, but I encountered an error while processing your request. Please try again later.",
+            error="Internal server error"
         )
 
 @app.exception_handler(404)
