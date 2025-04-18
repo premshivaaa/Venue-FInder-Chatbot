@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from typing import Optional, List, Dict, Tuple, Any
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,21 +16,32 @@ import urllib.parse
 import time
 from functools import lru_cache
 from ratelimit import limits, sleep_and_retry
+import traceback
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging for Vercel
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app.log') if os.path.exists('/tmp') else logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI()
+# Initialize FastAPI app with Vercel-specific settings
+app = FastAPI(
+    title="Venue Finder API",
+    description="API for finding and recommending venues",
+    version="1.0.0",
+    docs_url="/api/docs" if os.getenv('VERCEL_ENV') != 'production' else None,
+    redoc_url="/api/redoc" if os.getenv('VERCEL_ENV') != 'production' else None
+)
 
-# Configure CORS
+# Configure CORS for Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,11 +50,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
-static_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
-app.mount("/static", StaticFiles(directory=static_path), name="static")
+# Vercel-specific configuration
+VERCEL_ENV = os.getenv('VERCEL_ENV', 'development')
+IS_VERCEL = bool(os.getenv('VERCEL'))
+MAX_REQUEST_SIZE = 1024 * 1024  # 1MB
 
-# API Keys
+# Configure Gemini API
 try:
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
@@ -59,15 +71,9 @@ try:
         logger.error("MAPTILER_API_KEY is not set in environment variables")
         raise RuntimeError("MAPTILER_API_KEY is required")
 
-    # Configure Gemini API
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        logger.info("Successfully configured Gemini API")
-    except Exception as e:
-        logger.error(f"Error configuring Gemini API: {str(e)}", exc_info=True)
-        model = None
-        raise RuntimeError("Failed to configure Gemini API")
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.0-flash')
+    logger.info("Successfully configured Gemini API")
 
     # Test API connections
     try:
@@ -442,10 +448,97 @@ async def read_root():
         logger.error(f"Error serving index.html: {str(e)}")
         raise HTTPException(status_code=500, detail="Error serving the application")
 
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Middleware to add timing and error handling."""
+    start_time = time.time()
+    try:
+        # Check request size
+        if request.headers.get("content-length"):
+            content_length = int(request.headers["content-length"])
+            if content_length > MAX_REQUEST_SIZE:
+                raise HTTPException(status_code=413, detail="Request too large")
+
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        response.headers["X-Process-Time"] = str(process_time)
+        return response
+    except Exception as e:
+        logger.error(f"Request processing error: {str(e)}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal server error",
+                "error": str(e),
+                "traceback": traceback.format_exc() if VERCEL_ENV != 'production' else None
+            }
+        )
+
 @app.get("/api/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+async def health_check(background_tasks: BackgroundTasks):
+    """Enhanced health check endpoint for Vercel."""
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "environment": VERCEL_ENV,
+        "is_vercel": IS_VERCEL,
+        "api_status": {}
+    }
+
+    # Check API connections in background
+    async def check_apis():
+        try:
+            # Test Foursquare API
+            response = requests.get(
+                FOURSQUARE_BASE_URL,
+                headers=FOURSQUARE_HEADERS,
+                params={'limit': 1},
+                timeout=5
+            )
+            health_status["api_status"]["foursquare"] = response.status_code == 200
+        except Exception as e:
+            health_status["api_status"]["foursquare"] = False
+            logger.error(f"Foursquare API health check failed: {str(e)}")
+
+        try:
+            # Test MapTiler API
+            response = requests.get(
+                f"{MAPTILER_GEOCODING_URL}/test.json",
+                params={'key': MAPTILER_API_KEY},
+                headers=MAPTILER_HEADERS,
+                timeout=5
+            )
+            health_status["api_status"]["maptiler"] = response.status_code == 200
+        except Exception as e:
+            health_status["api_status"]["maptiler"] = False
+            logger.error(f"MapTiler API health check failed: {str(e)}")
+
+        try:
+            # Test Gemini API
+            if model:
+                response = model.generate_content("test")
+                health_status["api_status"]["gemini"] = True
+            else:
+                health_status["api_status"]["gemini"] = False
+        except Exception as e:
+            health_status["api_status"]["gemini"] = False
+            logger.error(f"Gemini API health check failed: {str(e)}")
+
+    background_tasks.add_task(check_apis)
+    return health_status
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler for all unhandled exceptions."""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error": str(exc),
+            "traceback": traceback.format_exc() if VERCEL_ENV != 'production' else None
+        }
+    )
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
