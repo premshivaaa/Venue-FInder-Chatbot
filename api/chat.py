@@ -44,22 +44,59 @@ static_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 # API Keys
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
-MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
-
-# Validate API keys
-if not all([GEMINI_API_KEY, FOURSQUARE_API_KEY, MAPTILER_API_KEY]):
-    logger.error("Missing required API keys in environment variables")
-    raise RuntimeError("Missing required API keys")
-
-# Configure Gemini API
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
+    MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
+
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY is not set in environment variables")
+        raise RuntimeError("GEMINI_API_KEY is required")
+    if not FOURSQUARE_API_KEY:
+        logger.error("FOURSQUARE_API_KEY is not set in environment variables")
+        raise RuntimeError("FOURSQUARE_API_KEY is required")
+    if not MAPTILER_API_KEY:
+        logger.error("MAPTILER_API_KEY is not set in environment variables")
+        raise RuntimeError("MAPTILER_API_KEY is required")
+
+    # Configure Gemini API
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        logger.info("Successfully configured Gemini API")
+    except Exception as e:
+        logger.error(f"Error configuring Gemini API: {str(e)}", exc_info=True)
+        model = None
+        raise RuntimeError("Failed to configure Gemini API")
+
+    # Test API connections
+    try:
+        # Test Foursquare API
+        test_response = requests.get(
+            FOURSQUARE_BASE_URL,
+            headers=FOURSQUARE_HEADERS,
+            params={'limit': 1},
+            timeout=5
+        )
+        test_response.raise_for_status()
+        logger.info("Successfully connected to Foursquare API")
+
+        # Test MapTiler API
+        test_response = requests.get(
+            f"{MAPTILER_GEOCODING_URL}/test.json",
+            params={'key': MAPTILER_API_KEY},
+            headers=MAPTILER_HEADERS,
+            timeout=5
+        )
+        test_response.raise_for_status()
+        logger.info("Successfully connected to MapTiler API")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API connection test failed: {str(e)}", exc_info=True)
+        raise RuntimeError("Failed to connect to one or more APIs")
+
 except Exception as e:
-    logger.error(f"Error configuring Gemini API: {str(e)}")
-    model = None
+    logger.critical(f"Critical initialization error: {str(e)}", exc_info=True)
+    raise RuntimeError("Failed to initialize the application")
 
 # API configuration
 FOURSQUARE_BASE_URL = "https://api.foursquare.com/v3/places/search"
@@ -414,53 +451,91 @@ async def health_check():
 async def chat(request: ChatRequest):
     """Handle chat requests with improved error handling and validation."""
     try:
+        logger.info(f"Received chat request: {request.message[:100]}...")  # Log first 100 chars
+        
         # Extract event details
-        event_details = extract_event_details(request.message)
+        try:
+            event_details = extract_event_details(request.message)
+            logger.info(f"Extracted event details: {event_details}")
+        except Exception as e:
+            logger.error(f"Error extracting event details: {str(e)}", exc_info=True)
+            return ChatResponse(
+                response="I'm having trouble understanding your request. Could you please provide more details?",
+                error="Event details extraction failed"
+            )
+
         if not event_details['location']:
+            logger.warning("No location specified in request")
             return ChatResponse(
                 response="I need to know the location to help you find venues. Please specify where you're looking.",
                 error="Location not specified"
             )
 
         # Search for venues
-        venues = search_foursquare_venues(
-            event_details['location'],
-            f"{event_details['event_type']} venue",
-            limit=5
-        )
+        try:
+            venues = search_foursquare_venues(
+                event_details['location'],
+                f"{event_details['event_type']} venue",
+                limit=5
+            )
+            logger.info(f"Found {len(venues)} venues for location: {event_details['location']}")
+        except Exception as e:
+            logger.error(f"Error searching venues: {str(e)}", exc_info=True)
+            return ChatResponse(
+                response=f"I encountered an error while searching for venues in {event_details['location']}. Please try again.",
+                error="Venue search failed"
+            )
 
         if not venues:
+            logger.warning(f"No venues found for location: {event_details['location']}")
             return ChatResponse(
                 response=f"I couldn't find any venues in {event_details['location']} for {event_details['event_type']}. Please try a different location or event type.",
                 error="No venues found"
             )
 
         # Process venues
-        processed_venues = process_venues(
-            venues,
-            event_details['event_type'],
-            event_details['requirements']
-        )
+        try:
+            processed_venues = process_venues(
+                venues,
+                event_details['event_type'],
+                event_details['requirements']
+            )
+            logger.info(f"Processed {len(processed_venues)} venues")
+        except Exception as e:
+            logger.error(f"Error processing venues: {str(e)}", exc_info=True)
+            return ChatResponse(
+                response="I found some venues but had trouble processing them. Please try again.",
+                error="Venue processing failed"
+            )
 
         # Generate response
-        response = get_gemini_response(
-            f"Based on the following venues, provide a helpful response to the user's request: {request.message}\n\n"
-            f"Available venues: {json.dumps(processed_venues[:3])}"
-        )
+        try:
+            response = get_gemini_response(
+                f"Based on the following venues, provide a helpful response to the user's request: {request.message}\n\n"
+                f"Available venues: {json.dumps(processed_venues[:3])}"
+            )
+            logger.info("Successfully generated Gemini response")
+        except Exception as e:
+            logger.error(f"Error generating Gemini response: {str(e)}", exc_info=True)
+            return ChatResponse(
+                response="I found some venues but had trouble generating a response. Here are the venues I found:",
+                venues=processed_venues[:3],
+                error="Response generation failed"
+            )
 
         return ChatResponse(
             response=response,
-            venues=processed_venues[:3]  # Return top 3 most relevant venues
+            venues=processed_venues[:3]
         )
 
     except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
+        logger.error(f"Validation error: {str(e)}", exc_info=True)
         return ChatResponse(
             response="I'm sorry, but I couldn't process your request. Please check your input and try again.",
             error=str(e)
         )
     except Exception as e:
-        logger.error(f"Unexpected error in chat endpoint: {str(e)}")
+        logger.error(f"Unexpected error in chat endpoint: {str(e)}", exc_info=True)
         return ChatResponse(
             response="I'm sorry, but I encountered an error while processing your request. Please try again later.",
             error="Internal server error"
