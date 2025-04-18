@@ -290,25 +290,21 @@ def extract_event_details(message: str) -> Dict:
 def search_foursquare_venues(location: str, query: str, limit: int = 10) -> List[dict]:
     """Search for venues using Foursquare API."""
     try:
-        def venue_request():
-            params = {
-                'query': query,
-                'near': location,
-                'limit': limit,
-                'fields': 'name,location,rating,price,fsq_id,geocodes,photos,categories,description'
-            }
-            
-            response = requests.get(
-                "https://api.foursquare.com/v3/places/search",
-                headers=FOURSQUARE_HEADERS,
-                params=params,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
-
-        data = retry_with_backoff(venue_request)
-        return data.get('results', [])
+        params = {
+            'query': query,
+            'near': location,
+            'limit': limit,
+            'fields': 'name,location,rating,price,fsq_id,geocodes,photos,categories,description'
+        }
+        
+        response = requests.get(
+            "https://api.foursquare.com/v3/places/search",
+            headers=FOURSQUARE_HEADERS,
+            params=params,
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get('results', [])
     except Exception as e:
         logger.error(f"Foursquare API error: {str(e)}")
         return []
@@ -316,24 +312,21 @@ def search_foursquare_venues(location: str, query: str, limit: int = 10) -> List
 def get_gemini_response(message: str) -> str:
     """Get response from Gemini API."""
     try:
-        def gemini_request():
-            prompt = {
-                "contents": [{
-                    "parts": [{
-                        "text": f"User: {message}\nAssistant:"
-                    }]
+        prompt = {
+            "contents": [{
+                "parts": [{
+                    "text": f"User: {message}\nAssistant:"
                 }]
-            }
-            
-            response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-                json=prompt,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
-
-        result = retry_with_backoff(gemini_request)
+            }]
+        }
+        
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            json=prompt,
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
         return result['candidates'][0]['content']['parts'][0]['text']
     except Exception as e:
         logger.error(f"Gemini API error: {str(e)}")
@@ -460,22 +453,53 @@ async def chat(request: ChatRequest):
             query = "sports venue"
         elif "restaurant" in message or "dining" in message:
             query = "restaurant"
+        elif "hotel" in message or "accommodation" in message:
+            query = "hotel"
+        elif "event" in message or "party" in message:
+            query = "event space"
 
         # Search for venues
-        venues = search_foursquare_venues(
-            location,
-            query
-        )
-        
+        try:
+            venues = search_foursquare_venues(location, query)
+        except Exception as e:
+            logger.error(f"Error searching venues: {str(e)}")
+            venues = []
+
         # Get Gemini response
-        response = generate_helpful_response(
-            query,
-            location,
-            None,
-            None,
-            venues
-        )
-        
+        try:
+            response = get_gemini_response(f"Find {query} in {location}")
+        except Exception as e:
+            logger.error(f"Error getting Gemini response: {str(e)}")
+            response = None
+
+        # If no venues found or Gemini failed, provide a helpful response
+        if not venues:
+            response = f"""I couldn't find specific venues for {query} in {location}.
+            Here are some suggestions to help refine your search:
+            1. Try a different location or expand your search radius
+            2. Consider alternative venue types
+            3. Be more specific about the type of venue
+            
+            Would you like to try any of these suggestions?"""
+        elif not response or "I'm having trouble" in response:
+            response = f"I found {len(venues)} venues for {query} in {location}:\n\n"
+            
+            for i, venue in enumerate(venues, 1):
+                response += f"{i}. {venue['name']}\n"
+                response += f"   - Type: {venue.get('categories', [{}])[0].get('name', 'Venue')}\n"
+                if venue.get('rating'):
+                    response += f"   - Rating: {venue['rating']}/10\n"
+                if venue.get('price'):
+                    response += f"   - Price Level: {'$' * venue['price']}\n"
+                if venue.get('location', {}).get('formatted_address'):
+                    response += f"   - Address: {venue['location']['formatted_address']}\n"
+                response += "\n"
+
+            if len(venues) < 10:
+                response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
+            else:
+                response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+
         return JSONResponse(
             content={
                 "success": True,
