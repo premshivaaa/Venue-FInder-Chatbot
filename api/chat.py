@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import re
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -41,22 +41,28 @@ app.add_middleware(
 static_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 app.mount("/static", StaticFiles(directory=static_path), name="static")
 
+# API Keys
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
+MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
+
+# Validate API keys
+if not all([GEMINI_API_KEY, FOURSQUARE_API_KEY, MAPTILER_API_KEY]):
+    logger.error("Missing required API keys in environment variables")
+    raise RuntimeError("Missing required API keys")
+
 # Configure Gemini API
 try:
-    genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+    genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.0-flash')
 except Exception as e:
     logger.error(f"Error configuring Gemini API: {str(e)}")
     model = None
 
-# Foursquare API configuration
-FOURSQUARE_API_KEY = os.getenv('FOURSQUARE_API_KEY')
+# API configuration
 FOURSQUARE_BASE_URL = "https://api.foursquare.com/v3/places/search"
 FOURSQUARE_PLACE_DETAILS_URL = "https://api.foursquare.com/v3/places/"
 FOURSQUARE_PHOTOS_URL = "https://api.foursquare.com/v3/places/{}/photos"
-
-# MapTiler API configuration
-MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY')
 MAPTILER_GEOCODING_URL = "https://api.maptiler.com/geocoding"
 
 # API Headers
@@ -122,7 +128,8 @@ def get_geocode(location: str) -> Tuple[Optional[float], Optional[float]]:
             response = requests.get(
                 f"{MAPTILER_GEOCODING_URL}/{urllib.parse.quote(location)}.json",
                 params={"key": MAPTILER_API_KEY},
-                headers=MAPTILER_HEADERS
+                headers=MAPTILER_HEADERS,
+                timeout=10
             )
             response.raise_for_status()
             return response.json()
@@ -134,7 +141,7 @@ def get_geocode(location: str) -> Tuple[Optional[float], Optional[float]]:
             return coords[1], coords[0]  # latitude, longitude
         return None, None
     except Exception as e:
-        logger.error(f"Geocoding error: {str(e)}")
+        logger.error(f"Geocoding error for location '{location}': {str(e)}")
         return None, None
 
 def get_venue_photos(fsq_id: str) -> List[str]:
@@ -143,7 +150,8 @@ def get_venue_photos(fsq_id: str) -> List[str]:
         def photos_request():
             response = requests.get(
                 FOURSQUARE_PHOTOS_URL.format(fsq_id),
-                headers=FOURSQUARE_HEADERS
+                headers=FOURSQUARE_HEADERS,
+                timeout=10
             )
             response.raise_for_status()
             return response.json()
@@ -155,26 +163,24 @@ def get_venue_photos(fsq_id: str) -> List[str]:
             if 'prefix' in photo and 'suffix' in photo:
                 photos.append(f"{photo['prefix']}original{photo['suffix']}")
         
-        return photos
+        return photos[:3]  # Return max 3 photos
     except Exception as e:
-        logger.error(f"Error getting venue photos: {str(e)}")
+        logger.error(f"Error getting venue photos for {fsq_id}: {str(e)}")
         return []
 
-def get_venue_details(fsq_id: str) -> Dict:
+def get_venue_details(fsq_id: str) -> Dict[str, Any]:
     """Get detailed information about a venue from Foursquare."""
     try:
         def details_request():
             response = requests.get(
                 f"{FOURSQUARE_PLACE_DETAILS_URL}{fsq_id}",
-                headers=FOURSQUARE_HEADERS
+                headers=FOURSQUARE_HEADERS,
+                timeout=10
             )
             response.raise_for_status()
             return response.json()
 
         data = retry_with_backoff(details_request)
-        
-        # Get photos
-        photos = get_venue_photos(fsq_id)
         
         return {
             'capacity': data.get('capacity', 0),
@@ -182,11 +188,48 @@ def get_venue_details(fsq_id: str) -> Dict:
             'amenities': data.get('amenities', []),
             'hours': data.get('hours', {}),
             'contact': data.get('contact', {}),
-            'photos': photos
+            'photos': get_venue_photos(fsq_id)
         }
     except Exception as e:
-        logger.error(f"Error getting venue details: {str(e)}")
+        logger.error(f"Error getting venue details for {fsq_id}: {str(e)}")
         return {}
+
+def process_venues(raw_venues: List[dict], event_type: str, keywords: List[str]) -> List[dict]:
+    """Process raw venue data into standardized format."""
+    processed_venues = []
+    
+    for venue in raw_venues:
+        try:
+            fsq_id = venue.get('fsq_id')
+            if not fsq_id:
+                continue
+                
+            details = get_venue_details(fsq_id)
+            
+            processed_venue = {
+                'name': venue.get('name', 'Unknown Venue'),
+                'type': venue.get('categories', [{}])[0].get('name', 'Venue'),
+                'address': venue.get('location', {}).get('formatted_address', 'Address not available'),
+                'rating': venue.get('rating'),
+                'price': venue.get('price'),
+                'capacity': details.get('capacity'),
+                'image': details['photos'][0] if details.get('photos') else None,
+                'latitude': venue.get('geocodes', {}).get('main', {}).get('latitude'),
+                'longitude': venue.get('geocodes', {}).get('main', {}).get('longitude'),
+                'description': details.get('description'),
+                'amenities': details.get('amenities'),
+                'hours': details.get('hours'),
+                'contact': details.get('contact'),
+                'relevance_score': calculate_relevance_score(venue, event_type, keywords)
+            }
+            
+            processed_venues.append(processed_venue)
+        except Exception as e:
+            logger.error(f"Error processing venue {venue.get('name')}: {str(e)}")
+            continue
+    
+    # Sort by relevance score descending
+    return sorted(processed_venues, key=lambda x: x.get('relevance_score', 0), reverse=True)
 
 def calculate_relevance_score(venue: dict, event_type: str, keywords: List[str]) -> float:
     """Calculate a relevance score for a venue based on the search criteria."""
@@ -196,27 +239,27 @@ def calculate_relevance_score(venue: dict, event_type: str, keywords: List[str])
     score += venue.get('rating', 0) * 0.2
     
     # Category match
-    venue_categories = [cat.lower() for cat in venue.get('categories', [])]
+    venue_categories = [cat.get('name', '').lower() for cat in venue.get('categories', [])]
     for keyword in keywords:
-        if any(keyword in cat for cat in venue_categories):
+        if any(keyword.lower() in cat for cat in venue_categories):
             score += 0.3
     
     # Description match
     description = venue.get('description', '').lower()
     for keyword in keywords:
-        if keyword in description:
+        if keyword.lower() in description:
             score += 0.2
     
     # Name match
     name = venue.get('name', '').lower()
     for keyword in keywords:
-        if keyword in name:
+        if keyword.lower() in name:
             score += 0.3
     
     return min(score, 1.0)  # Normalize to 0-1 range
 
-def extract_event_details(message: str) -> Dict:
-    """Extract event details using NLP techniques."""
+def extract_event_details(message: str) -> Dict[str, Any]:
+    """Extract event details from the user message."""
     message = message.lower()
     details = {
         'event_type': 'general',
@@ -227,14 +270,14 @@ def extract_event_details(message: str) -> Dict:
         'keywords': []
     }
 
-    # Use Gemini for initial analysis if available
+    # Use Gemini for analysis if available
     if model:
         try:
             prompt = f"""Analyze this venue search request and extract key information:
             Message: {message}
             
             Please provide a JSON response with:
-            1. event_type (business, sports, wedding, social, graduation, exhibition, dining, accommodation, entertainment)
+            1. event_type (business, wedding, social, conference, sports, dining, accommodation)
             2. location (city or area)
             3. capacity (number of people)
             4. budget (in dollars)
@@ -243,7 +286,7 @@ def extract_event_details(message: str) -> Dict:
             
             Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}
             
-            If any field is not found, use null or an empty list. Never return an error."""
+            If any field is not found, use null or an empty list."""
             
             def gemini_request():
                 response = model.generate_content(prompt)
@@ -258,7 +301,7 @@ def extract_event_details(message: str) -> Dict:
         except Exception as e:
             logger.error(f"Error using Gemini for analysis: {str(e)}")
 
-    # Fallback to regex if Gemini fails or is not available
+    # Fallback to regex extraction
     if not details['location']:
         location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
         location_match = re.search(location_pattern, message)
@@ -280,10 +323,10 @@ def extract_event_details(message: str) -> Dict:
                 amount *= 1000
             details['budget'] = amount
 
-    # Extract keywords from the message
+    # Extract keywords if not provided by Gemini
     if not details['keywords']:
-        words = message.split()
-        details['keywords'] = [word for word in words if len(word) > 3]
+        words = re.findall(r'\b\w{4,}\b', message)
+        details['keywords'] = [word for word in words if word not in ['find', 'looking', 'for', 'venue', 'place']]
 
     return details
 
@@ -298,7 +341,7 @@ def search_foursquare_venues(location: str, query: str, limit: int = 10) -> List
         }
         
         response = requests.get(
-            "https://api.foursquare.com/v3/places/search",
+            FOURSQUARE_BASE_URL,
             headers=FOURSQUARE_HEADERS,
             params=params,
             timeout=10
@@ -306,7 +349,7 @@ def search_foursquare_venues(location: str, query: str, limit: int = 10) -> List
         response.raise_for_status()
         return response.json().get('results', [])
     except Exception as e:
-        logger.error(f"Foursquare API error: {str(e)}")
+        logger.error(f"Foursquare API error for query '{query}' in '{location}': {str(e)}")
         return []
 
 def get_gemini_response(message: str) -> str:
@@ -327,52 +370,10 @@ def get_gemini_response(message: str) -> str:
         )
         response.raise_for_status()
         result = response.json()
-        return result['candidates'][0]['content']['parts'][0]['text']
+        return clean_gemini_response(result['candidates'][0]['content']['parts'][0]['text'])
     except Exception as e:
         logger.error(f"Gemini API error: {str(e)}")
         return "I'm having trouble processing your request. Please try again."
-
-def generate_helpful_response(query: str, location: str, capacity: Optional[int], budget: Optional[int], venues: List[dict]) -> str:
-    """Generate a helpful response based on the search results."""
-    try:
-        if not venues:
-            return f"""I couldn't find specific venues for {query} in {location}.
-            Here are some suggestions to help refine your search:
-            1. Try a different location or expand your search radius
-            2. Consider alternative venue types
-            3. Adjust your capacity or budget requirements
-            4. Be more specific about the type of venue
-            
-            Would you like to try any of these suggestions?"""
-
-        # Get Gemini response
-        response = get_gemini_response(f"Find {query} in {location}")
-        
-        # If Gemini fails, use template response
-        if not response or "I'm having trouble" in response:
-            response = f"I found {len(venues)} venues for {query} in {location}:\n\n"
-            
-            for i, venue in enumerate(venues, 1):
-                response += f"{i}. {venue['name']}\n"
-                response += f"   - Type: {venue.get('categories', [{}])[0].get('name', 'Venue')}\n"
-                if venue.get('rating'):
-                    response += f"   - Rating: {venue['rating']}/10\n"
-                if venue.get('price'):
-                    response += f"   - Price Level: {'$' * venue['price']}\n"
-                if venue.get('location', {}).get('formatted_address'):
-                    response += f"   - Address: {venue['location']['formatted_address']}\n"
-                response += "\n"
-
-            if len(venues) < 10:
-                response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
-            else:
-                response += "\nWould you like more information about any of these venues or would you like to refine your search?"
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
-        return "I found some venues for you, but I'm having trouble formatting the details. Would you like to try a different search?"
 
 @app.get("/")
 async def read_root():
@@ -386,137 +387,95 @@ async def read_root():
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
-    return JSONResponse(content={"status": "healthy"})
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
+    """Handle chat requests and venue searches."""
     try:
-        # Validate API keys
-        if not FOURSQUARE_API_KEY or not GEMINI_API_KEY:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False,
-                    "error": "Missing API keys",
-                    "response": "I'm currently having trouble accessing the venue database. Please try again in a few moments."
-                }
-            )
-
-        # Validate message
+        # Validate input
         if not request.message or len(request.message.strip()) < 3:
-            return JSONResponse(
+            raise HTTPException(
                 status_code=400,
-                content={
-                    "success": False,
-                    "response": "Please provide more details about the venue you're looking for. For example: 'Find a wedding venue in New York for 200 people'"
-                }
+                detail="Please provide more details about the venue you're looking for."
             )
 
-        # Extract location and query from message
-        message = request.message.lower()
-        location = None
-        query = None
-
-        # Try to extract location
-        location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
-        location_match = re.search(location_pattern, message)
-        if location_match:
-            location = location_match.group(2).strip()
-
+        # Extract event details
+        event_details = extract_event_details(request.message)
+        location = event_details.get('location')
+        
         if not location:
             return JSONResponse(
                 status_code=400,
                 content={
                     "success": False,
-                    "response": "I need to know where you're looking for venues. Please include a location in your request. For example: 'Find venues in New York'"
+                    "response": "Please specify a location in your request (e.g., 'Find venues in New York')."
                 }
             )
 
-        # Get location coordinates
+        # Get coordinates for the location
         lat, lng = get_geocode(location)
         if not lat or not lng:
             return JSONResponse(
                 status_code=400,
                 content={
                     "success": False,
-                    "response": f"I couldn't find the location '{location}'. Please try being more specific or check the spelling. You can try:\n1. Using the full city name\n2. Adding the state or country\n3. Using a nearby landmark"
+                    "response": f"I couldn't find the location '{location}'. Please try being more specific."
                 }
             )
 
-        # Extract query from message
-        query = "venue"  # Default query
-        if "wedding" in message:
-            query = "wedding venue"
-        elif "business" in message or "conference" in message:
-            query = "conference center"
-        elif "sports" in message:
-            query = "sports venue"
-        elif "restaurant" in message or "dining" in message:
-            query = "restaurant"
-        elif "hotel" in message or "accommodation" in message:
-            query = "hotel"
-        elif "event" in message or "party" in message:
-            query = "event space"
+        # Determine search query based on event type
+        query_mapping = {
+            'wedding': 'wedding venue',
+            'business': 'conference center',
+            'conference': 'conference center',
+            'sports': 'sports venue',
+            'dining': 'restaurant',
+            'accommodation': 'hotel',
+            'social': 'event space'
+        }
+        
+        query = query_mapping.get(event_details['event_type'], 'venue')
+        if event_details['keywords']:
+            query = ' '.join([query] + event_details['keywords'][:2])
 
         # Search for venues
+        raw_venues = search_foursquare_venues(location, query)
+        if not raw_venues:
+            return JSONResponse(
+                content={
+                    "success": True,
+                    "response": f"I couldn't find any {query} venues in {location}. Try broadening your search criteria.",
+                    "venues": []
+                }
+            )
+
+        # Process venues with relevance scoring
+        venues = process_venues(raw_venues, event_details['event_type'], event_details['keywords'])
+        
+        # Generate response
         try:
-            venues = search_foursquare_venues(location, query)
-        except Exception as e:
-            logger.error(f"Error searching venues: {str(e)}")
-            venues = []
-
-        # Get Gemini response
-        try:
-            response = get_gemini_response(f"Find {query} in {location}")
-        except Exception as e:
-            logger.error(f"Error getting Gemini response: {str(e)}")
-            response = None
-
-        # If no venues found or Gemini failed, provide a helpful response
-        if not venues:
-            response = f"""I couldn't find specific venues for {query} in {location}.
-            Here are some suggestions to help refine your search:
-            1. Try a different location or expand your search radius
-            2. Consider alternative venue types
-            3. Be more specific about the type of venue
-            
-            Would you like to try any of these suggestions?"""
-        elif not response or "I'm having trouble" in response:
-            response = f"I found {len(venues)} venues for {query} in {location}:\n\n"
-            
-            for i, venue in enumerate(venues, 1):
-                response += f"{i}. {venue['name']}\n"
-                response += f"   - Type: {venue.get('categories', [{}])[0].get('name', 'Venue')}\n"
-                if venue.get('rating'):
-                    response += f"   - Rating: {venue['rating']}/10\n"
-                if venue.get('price'):
-                    response += f"   - Price Level: {'$' * venue['price']}\n"
-                if venue.get('location', {}).get('formatted_address'):
-                    response += f"   - Address: {venue['location']['formatted_address']}\n"
-                response += "\n"
-
-            if len(venues) < 10:
-                response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
-            else:
-                response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+            response = get_gemini_response(
+                f"Generate a friendly response about finding {len(venues)} {query} venues in {location}"
+            )
+        except Exception:
+            response = f"I found {len(venues)} venues in {location} that match your criteria."
 
         return JSONResponse(
             content={
                 "success": True,
                 "response": response,
-                "venues": venues
+                "venues": venues[:10]  # Return top 10 venues
             }
         )
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {str(e)}")
-        return JSONResponse(
+        logger.error(f"Error in chat endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(
             status_code=500,
-            content={
-                "success": False,
-                "error": str(e),
-                "response": "I'm having trouble processing your request right now. Please try again with a different query or try again in a few moments."
-            }
+            detail="An error occurred while processing your request. Please try again."
         )
 
 @app.exception_handler(404)
@@ -524,7 +483,7 @@ async def not_found_exception_handler(request: Request, exc: HTTPException):
     """Handle 404 Not Found errors."""
     return JSONResponse(
         status_code=404,
-        content={"detail": "The requested resource was not found. Please check the URL and try again."}
+        content={"detail": "The requested resource was not found."}
     )
 
 @app.exception_handler(500)
@@ -532,9 +491,9 @@ async def internal_server_error_handler(request: Request, exc: HTTPException):
     """Handle 500 Internal Server errors."""
     return JSONResponse(
         status_code=500,
-        content={"detail": "An internal server error occurred. Please try again later."}
+        content={"detail": "An internal server error occurred."}
     )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)
