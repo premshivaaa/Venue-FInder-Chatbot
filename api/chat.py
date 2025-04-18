@@ -241,7 +241,9 @@ def extract_event_details(message: str) -> Dict:
             5. specific_requirements (list of specific needs)
             6. keywords (list of relevant keywords for the search)
             
-            Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}"""
+            Format: {{"event_type": "...", "location": "...", "capacity": number, "budget": number, "specific_requirements": [...], "keywords": [...]}}
+            
+            If any field is not found, use null or an empty list. Never return an error."""
             
             def gemini_request():
                 response = model.generate_content(prompt)
@@ -277,6 +279,11 @@ def extract_event_details(message: str) -> Dict:
             if budget_match.group(3):
                 amount *= 1000
             details['budget'] = amount
+
+    # Extract keywords from the message
+    if not details['keywords']:
+        words = message.split()
+        details['keywords'] = [word for word in words if len(word) > 3]
 
     return details
 
@@ -453,7 +460,8 @@ def generate_helpful_response(event_type: str, location: str, capacity: int, bud
                     4. Keeps the response friendly and natural
                     5. Ends with a question to help refine the search if needed
                     
-                    Format the response in a clear, easy-to-read way without any markdown or special formatting."""
+                    Format the response in a clear, easy-to-read way without any markdown or special formatting.
+                    Always provide a response, even if you're not sure about some details."""
                     
                     response = model.generate_content(prompt)
                     return clean_gemini_response(response.text)
