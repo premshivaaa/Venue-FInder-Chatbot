@@ -287,209 +287,93 @@ def extract_event_details(message: str) -> Dict:
 
     return details
 
-def get_foursquare_venues(lat: float, lng: float, event_type: str, keywords: List[str], radius: int = 5000) -> List[dict]:
-    """Get venues from Foursquare API based on location and event type."""
+def search_foursquare_venues(location: str, query: str, limit: int = 10) -> List[dict]:
+    """Search for venues using Foursquare API."""
     try:
-        category_mapping = {
-            'business': {
-                'categories': ['13035', '13036', '13037', '13038'],
-                'description': 'business meeting or conference',
-                'keywords': ['conference', 'meeting', 'business', 'corporate', 'office', 'work'],
-                'exclude_categories': ['13065', '13066', '13067', '13068']
-            },
-            'sports': {
-                'categories': ['18008', '18009', '18010', '18011', '18012', '18013', '18014'],
-                'description': 'sports event or tournament',
-                'keywords': ['sports', 'game', 'tournament', 'match', 'basketball', 'court', 'arena', 'stadium', 'gym', 'field', 'sport', 'athletic', 'fitness', 'training', 'competition'],
-                'exclude_categories': ['13065', '13066', '13067', '13068']
-            },
-            'wedding': {
-                'categories': ['13065', '13066', '13067', '13068'],
-                'description': 'wedding or reception',
-                'keywords': ['wedding', 'reception', 'marriage', 'ceremony']
-            },
-            'social': {
-                'categories': ['13065', '13066', '13067', '13068'],
-                'description': 'social event or party',
-                'keywords': ['party', 'celebration', 'social', 'event']
-            },
-            'graduation': {
-                'categories': ['13065', '13066', '13067', '13068'],
-                'description': 'graduation ceremony',
-                'keywords': ['graduation', 'ceremony', 'commencement']
-            },
-            'exhibition': {
-                'categories': ['10000', '10001', '10002', '10003'],
-                'description': 'art exhibition or gallery',
-                'keywords': ['exhibition', 'gallery', 'art', 'show']
-            },
-            'dining': {
-                'categories': ['13065', '13066', '13067', '13068'],
-                'description': 'restaurant or dining venue',
-                'keywords': ['restaurant', 'cafe', 'dining', 'food']
-            },
-            'accommodation': {
-                'categories': ['19000', '19001', '19002'],
-                'description': 'hotel or accommodation',
-                'keywords': ['hotel', 'resort', 'accommodation', 'stay']
-            },
-            'entertainment': {
-                'categories': ['10000', '10001', '10002', '10003'],
-                'description': 'entertainment venue',
-                'keywords': ['theater', 'cinema', 'movie', 'play']
-            },
-            'general': {
-                'categories': ['13065', '13066', '13067', '13068'],
-                'description': 'general event space',
-                'keywords': ['venue', 'space', 'location', 'place']
+        def venue_request():
+            params = {
+                'query': query,
+                'near': location,
+                'limit': limit,
+                'fields': 'name,location,rating,price,fsq_id,geocodes,photos,categories,description'
             }
-        }
+            
+            response = requests.get(
+                "https://api.foursquare.com/v3/places/search",
+                headers=FOURSQUARE_HEADERS,
+                params=params,
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
 
-        event_info = category_mapping.get(event_type, category_mapping['general'])
-        categories = event_info['categories']
-        
-        # Try different search strategies
-        search_strategies = [
-            {"categories": ",".join(categories), "sort": "RATING"},
-            {"query": " ".join(keywords), "sort": "RATING"},
-            {"categories": ",".join(categories), "sort": "DISTANCE"},
-            {"query": " ".join(keywords), "sort": "DISTANCE"}
-        ]
-        
-        all_venues = []
-        for strategy in search_strategies:
-            try:
-                def venue_request():
-                    params = {
-                        "ll": f"{lat},{lng}",
-                        "radius": radius,
-                        "limit": 20,
-                        **strategy
-                    }
-                    response = requests.get(FOURSQUARE_BASE_URL, headers=FOURSQUARE_HEADERS, params=params)
-                    response.raise_for_status()
-                    return response.json()
-
-                data = retry_with_backoff(venue_request)
-                
-                for place in data.get('results', []):
-                    # Skip venues that don't match the event type
-                    venue_categories = [cat.get('id', '') for cat in place.get('categories', [])]
-                    if any(cat in event_info.get('exclude_categories', []) for cat in venue_categories):
-                        continue
-
-                    # Get detailed venue information
-                    details = get_venue_details(place.get('fsq_id', ''))
-                    
-                    # Get the best available image
-                    image = None
-                    if details.get('photos'):
-                        image = details['photos'][0]
-                    elif place.get('photos', [{}])[0].get('prefix'):
-                        image = f"{place['photos'][0]['prefix']}original{place['photos'][0]['suffix']}"
-                    
-                    venue = {
-                        'name': place.get('name', ''),
-                        'type': place.get('categories', [{}])[0].get('name', ''),
-                        'address': place.get('location', {}).get('formatted_address', ''),
-                        'rating': place.get('rating', 0),
-                        'price': place.get('price', 0),
-                        'capacity': details.get('capacity', 0),
-                        'image': image,
-                        'location': {
-                            'lat': place.get('geocodes', {}).get('main', {}).get('latitude'),
-                            'lng': place.get('geocodes', {}).get('main', {}).get('longitude')
-                        },
-                        'description': details.get('description', ''),
-                        'amenities': details.get('amenities', []),
-                        'hours': details.get('hours', {}),
-                        'contact': details.get('contact', {})
-                    }
-                    
-                    # Calculate relevance score
-                    venue['relevance_score'] = calculate_relevance_score(venue, event_type, keywords)
-                    
-                    # Add venue if not already in the list
-                    if not any(v['name'] == venue['name'] for v in all_venues):
-                        all_venues.append(venue)
-                
-            except Exception as e:
-                logger.error(f"Error in search strategy: {str(e)}")
-                continue
-        
-        # Sort by relevance score and rating
-        all_venues.sort(key=lambda x: (x.get('relevance_score', 0), x.get('rating', 0)), reverse=True)
-        
-        # Filter out venues with very low relevance
-        relevant_venues = [v for v in all_venues if v.get('relevance_score', 0) > 0.3]
-        
-        return relevant_venues[:10] if len(relevant_venues) > 10 else relevant_venues
-
+        data = retry_with_backoff(venue_request)
+        return data.get('results', [])
     except Exception as e:
         logger.error(f"Foursquare API error: {str(e)}")
         return []
 
-def generate_helpful_response(event_type: str, location: str, capacity: int, budget: int, venues: List[dict]) -> str:
+def get_gemini_response(message: str) -> str:
+    """Get response from Gemini API."""
+    try:
+        def gemini_request():
+            prompt = {
+                "contents": [{
+                    "parts": [{
+                        "text": f"User: {message}\nAssistant:"
+                    }]
+                }]
+            }
+            
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                json=prompt,
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+
+        result = retry_with_backoff(gemini_request)
+        return result['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        logger.error(f"Gemini API error: {str(e)}")
+        return "I'm having trouble processing your request. Please try again."
+
+def generate_helpful_response(query: str, location: str, capacity: Optional[int], budget: Optional[int], venues: List[dict]) -> str:
     """Generate a helpful response based on the search results."""
     try:
         if not venues:
-            return f"""I couldn't find specific venues for your {event_type} event in {location}.
+            return f"""I couldn't find specific venues for {query} in {location}.
             Here are some suggestions to help refine your search:
             1. Try a different location or expand your search radius
             2. Consider alternative venue types
             3. Adjust your capacity or budget requirements
-            4. Be more specific about the type of event
+            4. Be more specific about the type of venue
             
             Would you like to try any of these suggestions?"""
 
-        # Use Gemini for response generation if available
-        if model:
-            try:
-                def gemini_response():
-                    prompt = f"""You are a helpful venue finding assistant. A user is looking for venues for a {event_type} event in {location}.
-                    {f'Capacity needed: {capacity} people' if capacity else ''}
-                    {f'Budget: ${budget}' if budget else ''}
-                    
-                    Here are the venues I found:
-                    {json.dumps(venues, indent=2)}
-                    
-                    Please provide a helpful, conversational response that:
-                    1. Acknowledges the user's request
-                    2. Lists the top venues with their key features
-                    3. Mentions any specific requirements that were met
-                    4. Keeps the response friendly and natural
-                    5. Ends with a question to help refine the search if needed
-                    
-                    Format the response in a clear, easy-to-read way without any markdown or special formatting.
-                    Always provide a response, even if you're not sure about some details."""
-                    
-                    response = model.generate_content(prompt)
-                    return clean_gemini_response(response.text)
-                
-                return retry_with_backoff(gemini_response)
-            except Exception as e:
-                logger.error(f"Error using Gemini for response: {str(e)}")
-
-        # Fallback to template response
-        response = f"I found {len(venues)} venues for your {event_type} event in {location}:\n\n"
+        # Get Gemini response
+        response = get_gemini_response(f"Find {query} in {location}")
         
-        for i, venue in enumerate(venues, 1):
-            response += f"{i}. {venue['name']}\n"
-            response += f"   - Type: {venue['type']}\n"
-            if venue.get('rating'):
-                response += f"   - Rating: {venue['rating']}/10\n"
-            if venue.get('capacity'):
-                response += f"   - Capacity: {venue['capacity']} people\n"
-            if venue.get('price'):
-                response += f"   - Price Level: {'$' * venue['price']}\n"
-            if venue.get('description'):
-                response += f"   - Description: {venue['description'][:100]}...\n"
-            response += "\n"
+        # If Gemini fails, use template response
+        if not response or "I'm having trouble" in response:
+            response = f"I found {len(venues)} venues for {query} in {location}:\n\n"
+            
+            for i, venue in enumerate(venues, 1):
+                response += f"{i}. {venue['name']}\n"
+                response += f"   - Type: {venue.get('categories', [{}])[0].get('name', 'Venue')}\n"
+                if venue.get('rating'):
+                    response += f"   - Rating: {venue['rating']}/10\n"
+                if venue.get('price'):
+                    response += f"   - Price Level: {'$' * venue['price']}\n"
+                if venue.get('location', {}).get('formatted_address'):
+                    response += f"   - Address: {venue['location']['formatted_address']}\n"
+                response += "\n"
 
-        if len(venues) < 10:
-            response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
-        else:
-            response += "\nWould you like more information about any of these venues or would you like to refine your search?"
+            if len(venues) < 10:
+                response += f"\nNote: I found {len(venues)} venues matching your criteria. Would you like to try a different search with broader parameters?"
+            else:
+                response += "\nWould you like more information about any of these venues or would you like to refine your search?"
 
         return response
 
@@ -511,74 +395,104 @@ async def health_check():
     """Health check endpoint."""
     return JSONResponse(content={"status": "healthy"})
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat")
 async def chat(request: ChatRequest):
     try:
         # Validate API keys
-        if not FOURSQUARE_API_KEY or not MAPTILER_API_KEY:
-            return ChatResponse(
-                response="I'm currently having trouble accessing the venue database. Please try again in a few moments.",
-                error="Missing API keys"
+        if not FOURSQUARE_API_KEY or not GEMINI_API_KEY:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error": "Missing API keys",
+                    "response": "I'm currently having trouble accessing the venue database. Please try again in a few moments."
+                }
             )
 
         # Validate message
         if not request.message or len(request.message.strip()) < 3:
-            return ChatResponse(
-                response="Please provide more details about the venue you're looking for. For example: 'Find a wedding venue in New York for 200 people'",
-                venues=None
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "response": "Please provide more details about the venue you're looking for. For example: 'Find a wedding venue in New York for 200 people'"
+                }
             )
 
-        # Extract event details from the message
-        event_details = extract_event_details(request.message)
-        
-        # Validate location
-        if not event_details['location']:
-            return ChatResponse(
-                response="I need to know where you're looking for venues. Please include a location in your request. For example: 'Find venues in New York'",
-                venues=None
+        # Extract location and query from message
+        message = request.message.lower()
+        location = None
+        query = None
+
+        # Try to extract location
+        location_pattern = r'(in|at|near|around|close to|within)\s+([^,.!?]+)'
+        location_match = re.search(location_pattern, message)
+        if location_match:
+            location = location_match.group(2).strip()
+
+        if not location:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "response": "I need to know where you're looking for venues. Please include a location in your request. For example: 'Find venues in New York'"
+                }
             )
 
         # Get location coordinates
-        lat, lng = get_geocode(event_details['location'])
+        lat, lng = get_geocode(location)
         if not lat or not lng:
-            return ChatResponse(
-                response=f"I couldn't find the location '{event_details['location']}'. Please try being more specific or check the spelling. You can try:\n1. Using the full city name\n2. Adding the state or country\n3. Using a nearby landmark",
-                venues=None
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "response": f"I couldn't find the location '{location}'. Please try being more specific or check the spelling. You can try:\n1. Using the full city name\n2. Adding the state or country\n3. Using a nearby landmark"
+                }
             )
 
-        # Get venues from Foursquare
-        venues = get_foursquare_venues(
-            lat, 
-            lng, 
-            event_details['event_type'],
-            event_details['keywords']
+        # Extract query from message
+        query = "venue"  # Default query
+        if "wedding" in message:
+            query = "wedding venue"
+        elif "business" in message or "conference" in message:
+            query = "conference center"
+        elif "sports" in message:
+            query = "sports venue"
+        elif "restaurant" in message or "dining" in message:
+            query = "restaurant"
+
+        # Search for venues
+        venues = search_foursquare_venues(
+            location,
+            query
         )
         
-        # Filter venues based on capacity and budget if provided
-        if event_details['capacity']:
-            venues = [v for v in venues if v.get('capacity', 0) >= event_details['capacity']]
-        if event_details['budget']:
-            venues = [v for v in venues if v.get('price', 0) <= event_details['budget']]
-
-        # Generate response
+        # Get Gemini response
         response = generate_helpful_response(
-            event_details['event_type'],
-            event_details['location'],
-            event_details['capacity'],
-            event_details['budget'],
+            query,
+            location,
+            None,
+            None,
             venues
         )
         
-        return ChatResponse(
-            response=response,
-            venues=venues if venues else None
+        return JSONResponse(
+            content={
+                "success": True,
+                "response": response,
+                "venues": venues
+            }
         )
 
     except Exception as e:
         logger.error(f"Error in chat endpoint: {str(e)}")
-        return ChatResponse(
-            response="I'm having trouble processing your request right now. Please try again with a different query or try again in a few moments.",
-            error=str(e)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e),
+                "response": "I'm having trouble processing your request right now. Please try again with a different query or try again in a few moments."
+            }
         )
 
 @app.exception_handler(404)
